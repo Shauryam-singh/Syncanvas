@@ -60,10 +60,14 @@ jobs:
         run: |
           npm run build:shared
           npm run build -w @syncanvas/client
-          npm run preview -w @syncanvas/client -- --port 5173 &
-          npx wait-on http://localhost:5173 --timeout 60000
 
       - name: Run the browser smoke test
         env:
+          # The runner ships Google Chrome; playwright's channel resolves it
+          # to /opt/google/chrome/chrome. The bundled Chromium is not
+          # installed, so no executablePath may be passed.
           SMOKE_CHANNEL: chrome
-        run: npm run smoke
+        run: |
+          npm run preview -w @syncanvas/client -- --port 5173 &
+          npx wait-on http://localhost:5173 --timeout 60000
+          npm run smoke

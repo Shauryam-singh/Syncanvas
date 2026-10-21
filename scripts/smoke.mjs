@@ -8,17 +8,50 @@
  *   npm run dev            # in one terminal
  *   npm run smoke          # in another
  *
- * Set CHROMIUM_PATH if the browser is not in the default Playwright location.
+ * Browser selection, in order of precedence:
+ *   CHROMIUM_PATH  exact binary to drive
+ *   SMOKE_CHANNEL  playwright channel ('chrome' uses the system Google Chrome)
+ *   default        a Chromium in the playwright browser cache, if there is one
  */
+import { existsSync, readdirSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { chromium } from 'playwright-core';
 
 const URL = process.env.SMOKE_URL ?? 'http://localhost:5173/';
-const EXECUTABLE = process.env.CHROMIUM_PATH ?? chromium.executablePath?.() ?? undefined;
 // GitHub runners ship Google Chrome, which playwright can drive directly.
 const CHANNEL = process.env.SMOKE_CHANNEL;
 
+/** Any Chromium already downloaded into the playwright browser cache. */
+function cachedChromium() {
+  const root = join(homedir(), '.cache', 'ms-playwright');
+  if (!existsSync(root)) return undefined;
+  const builds = readdirSync(root)
+    .filter((entry) => entry.startsWith('chromium-'))
+    .sort()
+    .reverse();
+  for (const build of builds) {
+    for (const relative of ['chrome-linux64/chrome', 'chrome-linux/chrome']) {
+      const candidate = join(root, build, relative);
+      if (existsSync(candidate)) return candidate;
+    }
+  }
+  return undefined;
+}
+
+function resolveExecutable() {
+  if (process.env.CHROMIUM_PATH) return process.env.CHROMIUM_PATH;
+  // A channel names a browser that playwright resolves itself. Passing an
+  // `executablePath` as well would override the channel and fail, because the
+  // bundled Chromium is not installed on a plain CI runner.
+  if (CHANNEL) return undefined;
+  const bundled = chromium.executablePath?.();
+  if (bundled && existsSync(bundled)) return bundled;
+  return cachedChromium();
+}
+
 const browser = await chromium.launch({
-  executablePath: EXECUTABLE,
+  executablePath: resolveExecutable(),
   channel: CHANNEL,
   args: ['--no-sandbox', '--disable-dev-shm-usage'],
 });
