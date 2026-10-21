@@ -32,6 +32,8 @@ describe('isMutableProp', () => {
     }
     expect(isMutableProp('id')).toBe(false);
     expect(isMutableProp('type')).toBe(false);
+    // zIndex is derived from the z-order sequence, never a user-editable register.
+    expect(isMutableProp('zIndex')).toBe(false);
     expect(isMutableProp('nope')).toBe(false);
   });
 });

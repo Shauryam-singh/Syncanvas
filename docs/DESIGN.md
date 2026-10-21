@@ -144,11 +144,21 @@ setProp(objectId, prop, value, hlc):
 
 Layer order is an RGA (Replicated Growable Array) of object ids:
 
-- `insertZOrder(objectId, afterId)` inserts after `afterId` (head when null).
+- `insertZOrder(objectId, afterId)` inserts after `afterId` (beginning of the
+  sequence when null).
 - Concurrent inserts after the same origin are ordered by the HLC total order,
   so every replica produces the identical sequence.
 - `zIndex` on each object is materialised from the sequence index (it is
   derived state, not a register — users do not edit it directly).
+
+**Stage 1 note.** The RGA itself lands in stage 3. Stage 1 keeps the same
+_shape_ — an explicit order array that owns the layering — but fills it with a
+naive rule: a new object is appended on top, and `insertZOrder` moves an
+object relative to a neighbour. The consequence is documented and tested:
+property writes are order independent, but **structural operations are not**
+(two concurrent creates stack differently depending on arrival order). That
+gap is exactly what the RGA plus HLC tie-break closes in stage 3, and it is the
+"why CRDT" story the project is built around.
 
 ### 4.4 RGA for text
 
@@ -365,13 +375,17 @@ tests that randomly partition clients).
 syncanvas/
 ├── client/                  # React + Vite + TS editor
 │   ├── src/
-│   │   ├── App.tsx          # Stage 0 shell
+│   │   ├── App.tsx          # Editor shell
+│   │   ├── canvas/          # SVG canvas, selection overlay, viewport maths
+│   │   ├── components/      # Toolbar, properties panel, status bar
+│   │   ├── hooks/           # Keyboard shortcuts
+│   │   ├── store/           # Zustand store (operations, undo/redo, draft)
 │   │   └── main.tsx
 │   ├── vite.config.ts
 │   └── tsconfig*.json
 ├── server/                  # Node.js gateway
 │   ├── src/
-│   │   ├── index.ts         # HTTP + health (WS gateway in stage 1)
+│   │   ├── index.ts         # HTTP + health (WS gateway in stage 2)
 │   │   └── config.ts
 │   └── tsconfig.json
 ├── shared/                  # Single source of truth for types + CRDT
@@ -380,14 +394,18 @@ syncanvas/
 │   │   ├── object.ts        # Object model (stage 0) ✅
 │   │   ├── operations.ts    # Op types + HLC (stage 0) ✅
 │   │   ├── protocol.ts      # WS message types (stage 0) ✅
-│   │   └── crdt/            # LWW-map, RGA, merge (stage 1–2)
+│   │   ├── geometry.ts      # Transform maths (stage 1) ✅
+│   │   ├── scene.ts         # Scene state + applyOp (stage 1) ✅
+│   │   └── crdt/            # LWW-map, RGA, merge (stage 3)
 │   └── tsconfig.json
+├── scripts/
+│   └── smoke.mjs            # Playwright smoke test
 ├── docs/
 │   └── DESIGN.md            # This document
 ├── docker-compose.yml       # Postgres 16 + Redis 7
 ├── eslint.config.mjs
 ├── tsconfig.base.json
-└── .github/workflows/ci.yml # lint + format + typecheck + test + build
+└── .github/workflows/ci.yml # lint + format + typecheck + test + build + smoke
 ```
 
 **Stage 0 acceptance:** `docker compose up` healthy on a clean machine, CI
@@ -395,13 +413,74 @@ green on an empty test, object model + protocol types published from `shared`.
 
 ---
 
-## 12. Roadmap
+## 12. Stage 1 — the single-user canvas
+
+The canvas is deliberately boring in one respect: **there is exactly one way
+to change the scene**. Every gesture ends in an operation, and `applyOp` is
+the only function that produces a new `SceneState`.
+
+```
+pointer event ──► canvas ──► store ──► applyOp() ──► scene state ──► render
+                      │         │
+                      │         └──► undo/redo (inverse operations)
+                      └──► transient draft, never persisted
+```
+
+### 12.1 Transform maths (`shared/src/geometry.ts`)
+
+The renderer and the interaction code must agree on where an object is, so
+both use the same pure helpers:
+
+- An object is an axis-aligned box `(x, y, w, h)` plus a `rotation` in
+  degrees around the **centre of the box**.
+- `toLocalPoint` / `toWorldPoint` move between world space and the object's
+  local frame; hit-testing and resizing both work in the local frame, so a
+  rotated object behaves exactly like an unrotated one.
+- `resizeObject(object, handle, pointer, options)` pins the **anchor** (the
+  opposite handle) in world space and grows the object along its own local
+  axes. Options: `preserveAspectRatio` (shift) and `fromCenter` (alt).
+- `hitTest(objects, point)` walks the stack from the top and returns the first
+  object under the pointer, so the top-most object wins.
+
+### 12.2 Scene state (`shared/src/scene.ts`)
+
+```ts
+interface SceneState {
+  objects: ReadonlyMap<string, SceneObject>;
+  order: readonly string[]; // object ids, bottom-most → top-most
+  tombstones: ReadonlySet<string>; // deleted ids, kept until compaction
+}
+```
+
+`applyOp(state, op)` is pure, immutable and idempotent. `zIndex` is
+_materialised_ from `order` on every structural change, so it is never a
+register a user can write to (`MUTABLE_PROPS` excludes it).
+
+### 12.3 Undo/redo
+
+Undo is implemented with inverse operations computed **before** the forward
+operations are applied — the only state they can undo. One user gesture is
+one undo entry, even when it produced several operations (a drag writes
+`x` and `y`). Redo replays the original operations.
+
+This is a local, single-user undo. Stage 5 replaces it with the per-user,
+cross-user semantics described in §4.5.
+
+### 12.4 What is _not_ in stage 1
+
+- `editText` is accepted but ignored: text is edited as a whole string
+  through `setProp('text', …)` until the per-character RGA lands in stage 3.
+- No WebSocket, no presence, no persistence — stage 2 onwards.
+- Concurrent creates are order sensitive (§4.3).
+
+## 13. Roadmap
 
 | Stage    | Milestone                                                             | Exit criterion                         |
 | -------- | --------------------------------------------------------------------- | -------------------------------------- |
-| 0 (this) | Monorepo, compose, CI, design doc, shared types                       | CI green; compose healthy              |
-| 1        | Canvas interaction, WS gateway, naive LWW sync                        | Two browsers move a rect live          |
-| 2        | Full CRDT (RGA, tombstones), presence/cursors, convergence fuzz tests | 10 000 randomized schedules converge   |
-| 3        | Redis pub/sub sharding, Postgres op log + snapshots, JWT rooms        | 2 gateways in sync; restart-safe       |
-| 4        | Offline outbox, undo/redo, version restore, k6 load tests             | p95 < 80 ms @ 200 users; 0 lost writes |
-| 5        | Dockerfiles, AWS deploy, GitHub Actions CD, README + demo GIF         | Live URL + demo video                  |
+| 0        | Monorepo, compose, CI, design doc, shared types                       | CI green; compose healthy              |
+| 1 (this) | Canvas, transform maths, operation pipeline, undo/redo                | 500 objects at 60 fps; ops only        |
+| 2        | WS gateway, naive LWW sync                                            | Two browsers move a rect live          |
+| 3        | Full CRDT (RGA, tombstones), presence/cursors, convergence fuzz tests | 10 000 randomized schedules converge   |
+| 4        | Redis pub/sub sharding, Postgres op log + snapshots, JWT rooms        | 2 gateways in sync; restart-safe       |
+| 5        | Offline outbox, per-user undo/redo, version restore, k6 load tests    | p95 < 80 ms @ 200 users; 0 lost writes |
+| 6        | Dockerfiles, AWS deploy, GitHub Actions CD, README + demo GIF         | Live URL + demo video                  |
