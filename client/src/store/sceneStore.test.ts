@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { createSceneState, getObjectsInOrder, type SceneObject } from '@syncanvas/shared';
+import { createSceneState, getObjectsInOrder, type Op, type SceneObject } from '@syncanvas/shared';
 import { invertGroup, useSceneStore } from './sceneStore';
 
 const store = () => useSceneStore.getState();
@@ -13,6 +13,9 @@ function reset(objects: SceneObject[] = []) {
     draft: [],
     undoStack: [],
     redoStack: [],
+    connection: 'local',
+    peers: [],
+    opSender: null,
   });
 }
 
@@ -95,6 +98,100 @@ describe('undo / redo', () => {
     expect(store().scene.objects.size).toBe(1);
     store().undo();
     expect(store().scene.objects.size).toBe(0);
+  });
+});
+
+describe('connected mode', () => {
+  const object: SceneObject = {
+    id: 'a',
+    type: 'rect',
+    x: 0,
+    y: 0,
+    w: 10,
+    h: 10,
+    rotation: 0,
+    fill: '#fff',
+    zIndex: 0,
+  };
+
+  /** Collects the operations the store hands to the gateway. */
+  function connect(): Array<{ ops: Op[]; meta: { undoable: boolean } }> {
+    const sent: Array<{ ops: Op[]; meta: { undoable: boolean } }> = [];
+    store().setOpSender((ops, meta) => sent.push({ ops, meta }));
+    return sent;
+  }
+
+  it('sends operations to the gateway instead of applying them', () => {
+    reset([object]);
+    const sent = connect();
+    store().dispatch([{ kind: 'setProp', objectId: 'a', prop: 'x', value: 5 }]);
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.meta.undoable).toBe(true);
+    // The scene is untouched until the gateway confirms the operation.
+    expect(store().scene.objects.get('a')?.x).toBe(0);
+    expect(store().undoStack).toHaveLength(0);
+  });
+
+  it('applies the confirmed operation and records the undo step', () => {
+    reset([object]);
+    const sent = connect();
+    store().dispatch([{ kind: 'setProp', objectId: 'a', prop: 'x', value: 5 }]);
+    store().applyServerOps(sent[0]?.ops ?? [], { mine: true, undoable: true });
+
+    expect(store().scene.objects.get('a')?.x).toBe(5);
+    expect(store().undoStack).toHaveLength(1);
+  });
+
+  it('does not record an undo step for somebody else’s operation', () => {
+    reset([object]);
+    store().applyServerOps([{ kind: 'setProp', objectId: 'a', prop: 'x', value: 5 }], {
+      mine: false,
+      undoable: false,
+    });
+
+    expect(store().scene.objects.get('a')?.x).toBe(5);
+    expect(store().undoStack).toHaveLength(0);
+  });
+
+  it('sends the inverse operations when undoing', () => {
+    reset([object]);
+    const sent = connect();
+    store().dispatch([{ kind: 'setProp', objectId: 'a', prop: 'x', value: 5 }]);
+    store().applyServerOps(sent[0]?.ops ?? [], { mine: true, undoable: true });
+
+    store().undo();
+    expect(sent).toHaveLength(2);
+    expect(sent[1]?.ops).toEqual([{ kind: 'setProp', objectId: 'a', prop: 'x', value: 0 }]);
+    // The confirmation of an undo is not a new undo step.
+    expect(sent[1]?.meta.undoable).toBe(false);
+    expect(store().undoStack).toHaveLength(0);
+    expect(store().redoStack).toHaveLength(1);
+  });
+
+  it('does not add an undo step when the confirmation of an undo arrives', () => {
+    reset([object]);
+    const sent = connect();
+    store().dispatch([{ kind: 'setProp', objectId: 'a', prop: 'x', value: 5 }]);
+    store().applyServerOps(sent[0]?.ops ?? [], { mine: true, undoable: true });
+    store().undo();
+    store().applyServerOps(sent[1]?.ops ?? [], { mine: true, undoable: false });
+
+    expect(store().scene.objects.get('a')?.x).toBe(0);
+    expect(store().undoStack).toHaveLength(0);
+    expect(store().redoStack).toHaveLength(1);
+  });
+
+  it('re-sends the original operations when redoing', () => {
+    reset([object]);
+    const sent = connect();
+    store().dispatch([{ kind: 'setProp', objectId: 'a', prop: 'x', value: 5 }]);
+    store().applyServerOps(sent[0]?.ops ?? [], { mine: true, undoable: true });
+    store().undo();
+    store().redo();
+
+    expect(sent).toHaveLength(3);
+    expect(sent[2]?.ops).toEqual([{ kind: 'setProp', objectId: 'a', prop: 'x', value: 5 }]);
   });
 });
 

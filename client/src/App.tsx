@@ -3,9 +3,11 @@ import { PropertiesPanel } from './components/PropertiesPanel';
 import { StatusBar } from './components/StatusBar';
 import { Toolbar } from './components/Toolbar';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
+import { useSync } from './net/useSync';
 
 export function App() {
   useKeyboardShortcuts();
+  useSync();
 
   return (
     <div className="app">
@@ -14,7 +16,7 @@ export function App() {
           <h1>Syncanvas</h1>
           <p>Real-time collaborative scene editor</p>
         </div>
-        <span className="badge">Stage 1 · canvas + operations</span>
+        <span className="badge">Stage 2 · gateway + naive LWW sync</span>
       </header>
 
       <Toolbar />

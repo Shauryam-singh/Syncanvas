@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import {
   applyOps,
+  createInitialScene,
   createSceneObject,
   createSceneState,
   getObjectsInOrder,
@@ -10,15 +11,25 @@ import {
   rotateObject,
   type MutableProp,
   type Op,
+  type PeerPresence,
   type Point,
   type ResizeHandle,
   type SceneObject,
   type SceneObjectType,
   type SceneState,
 } from '@syncanvas/shared';
-import { createInitialScene } from './initialScene';
+import type { ConnectionState } from '../net/syncClient';
 
 export type Tool = 'select' | SceneObjectType;
+
+/**
+ * Where local operations go.
+ *
+ * `null` means "apply them here and now" — the single-user behaviour of
+ * stage 1. When the gateway is connected the store hands the operations to
+ * the sync client instead, and they come back in the gateway's order.
+ */
+export type OpSender = (ops: Op[], meta: { undoable: boolean }) => void;
 
 export interface MoveInteraction {
   kind: 'move';
@@ -71,13 +82,24 @@ export interface SceneStore {
   /** One entry per user gesture; a gesture may contain several operations. */
   undoStack: UndoEntry[];
   redoStack: UndoEntry[];
+  /** How the editor is connected to the gateway. */
+  connection: ConnectionState;
+  /** The people in the room, this client included. */
+  peers: PeerPresence[];
+  /** Where local operations are sent; `null` means "apply them locally". */
+  opSender: OpSender | null;
 
   /** Applies operations as a single undoable step. */
   dispatch: (ops: Op[]) => void;
+  /** Applies operations the gateway confirmed, in the gateway's order. */
+  applyServerOps: (ops: Op[], meta: { mine: boolean; undoable: boolean }) => void;
   setTool: (tool: Tool) => void;
   setSelection: (ids: string[]) => void;
   toggleSelection: (id: string) => void;
   clearSelection: () => void;
+  setConnection: (connection: ConnectionState) => void;
+  setPeers: (peers: PeerPresence[]) => void;
+  setOpSender: (sender: OpSender | null) => void;
 
   createObject: (type: SceneObjectType, point: Point) => void;
   updateObject: (id: string, changes: EditableProps) => void;
@@ -156,9 +178,19 @@ export const useSceneStore = create<SceneStore>((set, get) => ({
   draft: [],
   undoStack: [],
   redoStack: [],
+  connection: 'local',
+  peers: [],
+  opSender: null,
 
   dispatch: (ops) => {
     if (ops.length === 0) return;
+    const sender = get().opSender;
+    if (sender) {
+      // Connected: the gateway owns the order. The operation is sent and
+      // applied when it comes back, so every replica folds the same history.
+      sender(ops, { undoable: true });
+      return;
+    }
     set((state) => ({
       scene: applyOps(state.scene, ops),
       // The inverses are computed against the state *before* the operations
@@ -166,6 +198,28 @@ export const useSceneStore = create<SceneStore>((set, get) => ({
       undoStack: [...state.undoStack, { ops, inverses: invertGroup(state.scene, ops) }],
       redoStack: [],
     }));
+  },
+
+  applyServerOps: (ops, meta) => {
+    if (ops.length === 0) return;
+    set((state) => {
+      const scene = applyOps(state.scene, ops);
+      if (!meta.mine) {
+        // Somebody else's edit: it changes the scene but it is not part of
+        // this user's history and cannot be undone by them.
+        return { scene };
+      }
+      if (!meta.undoable) {
+        // The confirmation of an undo or a redo: the stacks were already
+        // updated when the action was triggered.
+        return { scene };
+      }
+      return {
+        scene,
+        undoStack: [...state.undoStack, { ops, inverses: invertGroup(state.scene, ops) }],
+        redoStack: [],
+      };
+    });
   },
 
   setTool: (tool) => set({ tool }),
@@ -177,6 +231,9 @@ export const useSceneStore = create<SceneStore>((set, get) => ({
         : [...state.selection, id],
     })),
   clearSelection: () => set({ selection: [] }),
+  setConnection: (connection) => set({ connection }),
+  setPeers: (peers) => set({ peers }),
+  setOpSender: (opSender) => set({ opSender }),
 
   createObject: (type, point) => {
     const size = DEFAULT_SIZE[type];
@@ -426,9 +483,19 @@ export const useSceneStore = create<SceneStore>((set, get) => ({
   cancelInteraction: () => set({ interaction: null, draft: [] }),
 
   undo: () => {
-    const { scene, undoStack, redoStack } = get();
+    const { scene, undoStack, redoStack, opSender } = get();
     const entry = undoStack[undoStack.length - 1];
     if (!entry) return;
+    if (opSender) {
+      // Connected: undo is itself an edit. The inverse operations travel to
+      // the gateway like any other operation and are applied on the way back.
+      set({
+        undoStack: undoStack.slice(0, -1),
+        redoStack: [...redoStack, entry],
+      });
+      opSender(entry.inverses, { undoable: false });
+      return;
+    }
     set({
       scene: applyOps(scene, entry.inverses),
       undoStack: undoStack.slice(0, -1),
@@ -437,9 +504,17 @@ export const useSceneStore = create<SceneStore>((set, get) => ({
   },
 
   redo: () => {
-    const { scene, undoStack, redoStack } = get();
+    const { scene, undoStack, redoStack, opSender } = get();
     const entry = redoStack[redoStack.length - 1];
     if (!entry) return;
+    if (opSender) {
+      set({
+        redoStack: redoStack.slice(0, -1),
+        undoStack: [...undoStack, entry],
+      });
+      opSender(entry.ops, { undoable: false });
+      return;
+    }
     set({
       scene: applyOps(scene, entry.ops),
       undoStack: [...undoStack, entry],

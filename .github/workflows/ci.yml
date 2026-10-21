@@ -71,3 +71,36 @@ jobs:
           npm run preview -w @syncanvas/client -- --port 5173 &
           npx wait-on http://localhost:5173 --timeout 60000
           npm run smoke
+
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build the client and the gateway
+        run: |
+          npm run build:shared
+          npm run build -w @syncanvas/client
+          npm run build -w @syncanvas/server
+
+      - name: Run the two-browser sync test
+        env:
+          SMOKE_CHANNEL: chrome
+        run: |
+          # The test starts the gateway itself — it has to be able to restart
+          # it to check that the clients reconnect.
+          npm run preview -w @syncanvas/client -- --port 5173 &
+          npx wait-on http://localhost:5173 --timeout 60000
+          npm run smoke:sync

@@ -31,4 +31,12 @@ export default tseslint.config(
     files: ['**/*.mjs', '**/*.js'],
     ...tseslint.configs.disableTypeChecked,
   },
+  {
+    // The smoke scripts drive a browser: the callbacks they hand to
+    // `page.evaluate` run inside the page, not inside Node.
+    files: ['scripts/**/*.mjs'],
+    languageOptions: {
+      globals: { ...globals.browser },
+    },
+  },
 );

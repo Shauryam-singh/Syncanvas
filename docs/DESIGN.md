@@ -62,7 +62,24 @@ semantics; it is intended to evolve into the public README as the project ships.
    Client (React + Vite): local CRDT apply → optimistic render → send ops
 ```
 
-**Request flow for an edit**
+**Request flow for an edit (stage 2 — what is implemented today)**
+
+1. User drags a rect. The client renders a transient _draft_ while the pointer
+   moves and turns the finished gesture into one or two operations.
+2. The client stamps the operations with its HLC, puts the envelopes in its
+   outbox and sends an `ops` batch over the WebSocket. It does **not** apply
+   them locally — the gateway decides the order.
+3. The gateway stamps the envelopes with its own identity for the actor,
+   applies the batch to the room state, assigns it the next sequence number
+   and broadcasts it to the room — the author included.
+4. Every client folds the operations in sequence order, so all replicas end
+   with the same scene. The author applies its own operations at the same
+   moment as everybody else, which is what keeps the replicas identical.
+5. The gateway acknowledges the batch; the client drops the envelopes from
+   its outbox. A client that reconnects sends `sync {snapshotSeq, opIds}` and
+   re-sends only what the gateway is missing.
+
+**Request flow for an edit (stage 4 — the target architecture)**
 
 1. User drags a rect. Client mutates its local CRDT state and renders
    immediately (optimistic, never blocked on network).
@@ -75,6 +92,13 @@ semantics; it is intended to evolve into the public README as the project ships.
    out to their local sockets.
 5. A snapshot worker folds the op log into a snapshot every N ops / T seconds
    and compacts the log.
+
+> **The gap between the two flows is the point of the project.** Stage 2 orders
+> operations centrally, which is convergent but pays a round trip on every
+> edit and cannot merge two offline histories. Stage 3 replaces the ordering
+> point with an order-independent merge, which removes the round trip and makes
+> offline editing possible — at the price of having to get the CRDT right.
+> §13 measures what stage 2 costs.
 
 ---
 
@@ -204,26 +228,31 @@ hand-written interfaces on either side.
 
 ### Client → Server
 
-| `t`              | Payload                          | Purpose                               |
-| ---------------- | -------------------------------- | ------------------------------------- |
-| `auth`           | `{token}`                        | JWT handshake before `join`           |
-| `join`           | `{roomId}`                       | Subscribe + receive `state`           |
-| `ops`            | `{roomId, ops: OpEnvelope[]}`    | Batched edits (idempotent by `op.id`) |
-| `presence`       | `{roomId, cursor, selection}`    | Ephemeral, throttled ~30 Hz           |
-| `sync`           | `{roomId, snapshotSeq, opIds[]}` | Reconnect catch-up                    |
-| `leave` / `ping` | —                                | Lifecycle / RTT                       |
+| `t`              | Payload                          | Purpose                                         |
+| ---------------- | -------------------------------- | ----------------------------------------------- |
+| `auth`           | `{token, displayName?}`          | JWT handshake before `join` (stage 4: real JWT) |
+| `join`           | `{roomId}`                       | Subscribe + receive `state`                     |
+| `ops`            | `{roomId, ops: OpEnvelope[]}`    | Batched edits (idempotent by `op.id`)           |
+| `presence`       | `{roomId, cursor, selection}`    | Ephemeral, throttled ~30 Hz                     |
+| `sync`           | `{roomId, snapshotSeq, opIds[]}` | Reconnect catch-up                              |
+| `leave` / `ping` | —                                | Lifecycle / RTT                                 |
 
 ### Server → Client
 
-| `t`        | Payload                         | Purpose                         |
-| ---------- | ------------------------------- | ------------------------------- |
-| `welcome`  | `{userId, displayName}`         | Post-auth identity              |
-| `joined`   | `{role, snapshotSeq, peers[]}`  | Room admission                  |
-| `state`    | `{snapshotSeq, objects, ops[]}` | Baseline + ops after snapshot   |
-| `ops`      | `{seq, ops[]}`                  | Broadcast remote edits          |
-| `ack`      | `{opIds[], seq}`                | Persisted (safe to drop outbox) |
-| `presence` | `{peers[]}`                     | Cursor/selection fan-out        |
-| `error`    | `{code, message}`               | `unauthorized`/`forbidden`/…    |
+| `t`        | Payload                               | Purpose                                 |
+| ---------- | ------------------------------------- | --------------------------------------- |
+| `welcome`  | `{userId, displayName, color}`        | Post-auth identity (server-assigned id) |
+| `joined`   | `{roomId, role, snapshotSeq, peers}`  | Room admission                          |
+| `state`    | `{roomId, snapshotSeq, objects, ops}` | Baseline + ops after snapshot           |
+| `ops`      | `{roomId, seq, ops[]}`                | Broadcast of edits — author included    |
+| `ack`      | `{roomId, opIds[], seq}`              | Received (safe to drop from the outbox) |
+| `presence` | `{roomId, peers[]}`                   | Cursor/selection fan-out                |
+| `error`    | `{code, message}`                     | `unauthorized`/`forbidden`/…            |
+| `pong`     | —                                     | Liveness                                |
+
+The `userId` in `welcome` is assigned by the gateway: a client cannot choose
+its own identity and cannot forge the `actorId` of an envelope — the gateway
+stamps every envelope it accepts with the identity of the socket that sent it.
 
 ### Op envelope
 
@@ -236,9 +265,23 @@ hand-written interfaces on either side.
 }
 ```
 
-**Order-independence is a protocol invariant**: a gateway merges an incoming
-batch into state in _whatever order it arrives_ and the result must equal any
-other order. Replayed batches after reconnect are deduped by `op.id`.
+**The stage 2 invariant is total order, not order independence.** The gateway
+is the single ordering point: it applies each batch in the order it arrives
+and stamps it with the next sequence number. Every client folds the
+operations in that sequence, so all replicas converge — but the winner of two
+conflicting writes is decided by _arrival order_, not by the merge. This is
+deliberately the naive behaviour stage 2 asks for, and it is what makes the
+limitations visible:
+
+- two users drag the same rectangle at the same time → one drag is silently
+  discarded, and which one depends on who the gateway heard first;
+- an offline client cannot merge its history with anybody else's, because its
+  operations were never in the gateway's order.
+
+Replayed batches after a reconnect are deduped by `op.id`, so a client that
+re-sends its outbox cannot apply anything twice. Stage 3 replaces the
+ordering point with an order-independent merge (§4.2), which is what makes
+concurrent edits safe and offline editing possible.
 
 ---
 
@@ -366,6 +409,9 @@ tests that randomly partition clients).
 | JSON wire format first                         | Debuggable, types shared directly                                          | ~1.5× bytes vs MessagePack; revisit after load tests                             |
 | Op log + snapshots in Postgres                 | One transactional store; version restore falls out naturally               | Log growth requires disciplined compaction                                       |
 | Redis pub/sub (not Streams)                    | Ops are replayable from Postgres — Redis is transport, not source of truth | No Redis-side durability needed (and none claimed)                               |
+| Gateway as the single ordering point (stage 2) | One place decides the order → every replica folds the same history         | A round trip on every edit; concurrent writes lose intent silently               |
+| No optimistic apply (stage 2)                  | The scene is always a prefix of the server's history — no divergence       | Every keystroke waits for the round trip; feels laggy on a bad link              |
+| Broadcast to the author as well                | The author applies its own ops in the same order as everybody else         | The author cannot render before the server answers                               |
 
 ---
 
@@ -379,13 +425,16 @@ syncanvas/
 │   │   ├── canvas/          # SVG canvas, selection overlay, viewport maths
 │   │   ├── components/      # Toolbar, properties panel, status bar
 │   │   ├── hooks/           # Keyboard shortcuts
+│   │   ├── net/             # SyncClient + the useSync hook (stage 2) ✅
 │   │   ├── store/           # Zustand store (operations, undo/redo, draft)
 │   │   └── main.tsx
 │   ├── vite.config.ts
 │   └── tsconfig*.json
 ├── server/                  # Node.js gateway
 │   ├── src/
-│   │   ├── index.ts         # HTTP + health (WS gateway in stage 2)
+│   │   ├── index.ts         # HTTP + health + WebSocket upgrade (stage 2) ✅
+│   │   ├── gateway.ts       # Protocol handling, broadcast, server ids (stage 2) ✅
+│   │   ├── rooms.ts         # Room registry, naive LWW merge (stage 2) ✅
 │   │   └── config.ts
 │   └── tsconfig.json
 ├── shared/                  # Single source of truth for types + CRDT
@@ -393,19 +442,23 @@ syncanvas/
 │   │   ├── index.ts
 │   │   ├── object.ts        # Object model (stage 0) ✅
 │   │   ├── operations.ts    # Op types + HLC (stage 0) ✅
-│   │   ├── protocol.ts      # WS message types (stage 0) ✅
+│   │   ├── protocol.ts      # WS message types + runtime validators (stage 2) ✅
 │   │   ├── geometry.ts      # Transform maths (stage 1) ✅
 │   │   ├── scene.ts         # Scene state + applyOp (stage 1) ✅
+│   │   ├── hlc.ts           # Hybrid logical clock (stage 2) ✅
+│   │   ├── initialScene.ts  # Room seed scene (stage 2) ✅
 │   │   └── crdt/            # LWW-map, RGA, merge (stage 3)
 │   └── tsconfig.json
 ├── scripts/
-│   └── smoke.mjs            # Playwright smoke test
+│   ├── browser.mjs          # Chromium resolution shared by the smoke tests
+│   ├── smoke.mjs            # Playwright smoke test (stage 1) ✅
+│   └── sync-smoke.mjs       # Two-browser sync test (stage 2) ✅
 ├── docs/
 │   └── DESIGN.md            # This document
 ├── docker-compose.yml       # Postgres 16 + Redis 7
 ├── eslint.config.mjs
 ├── tsconfig.base.json
-└── .github/workflows/ci.yml # lint + format + typecheck + test + build + smoke
+└── .github/workflows/ci.yml # lint + format + typecheck + test + build + smoke + sync
 ```
 
 **Stage 0 acceptance:** `docker compose up` healthy on a clean machine, CI
@@ -473,13 +526,110 @@ cross-user semantics described in §4.5.
 - No WebSocket, no presence, no persistence — stage 2 onwards.
 - Concurrent creates are order sensitive (§4.3).
 
-## 13. Roadmap
+---
+
+## 13. Stage 2 — the gateway and the naive LWW sync
+
+Stage 2 adds the one thing stage 1 could not have: a **second person**. The
+architecture has three pieces.
+
+```
+┌────────────────┐  ops   ┌──────────────────┐  ops   ┌────────────────┐
+│ Client A       │ ─────► │ Gateway (ws)     │ ─────► │ Client B       │
+│ store ──► outbox│ ◄───── │ room registry    │ ◄───── │ store ◄── outbox│
+└────────────────┘  ack   │ naive LWW merge  │  ack   └────────────────┘
+                          │ seq per batch    │
+                          └──────────────────┘
+```
+
+### 14.1 The gateway (`server/src/gateway.ts`, `server/src/rooms.ts`)
+
+The gateway is deliberately small and has exactly one responsibility: **decide
+the order in which operations happen.**
+
+- A socket connects, sends `auth`, and receives a `welcome` with a
+  **server-assigned** `userId` and a colour. A client cannot choose its
+  identity, and every envelope the gateway accepts is stamped with the
+  identity of the socket that sent it — nobody can forge another peer.
+- `join` adds the client to a room and sends it the room state
+  (`snapshotSeq` + the objects) plus the roster.
+- An `ops` batch is merged into the room: the operations are applied in the
+  order they arrived, the room's sequence number advances by one, and the
+  batch is broadcast to **everyone in the room, the author included**.
+- `op.id` is the idempotency key. A batch that contains an operation the room
+  has already seen is not applied twice; the author is sent the full state
+  instead, because a duplicate means it missed a broadcast.
+- The rooms live in memory for now. `seenOpIds` is the replay guard that
+  moves into Postgres as `UNIQUE (room_id, op_key)` in stage 4.
+
+### 14.2 The client (`client/src/net/syncClient.ts`)
+
+- The client keeps an **outbox** of envelopes it has sent but the gateway has
+  not acknowledged. An acknowledged envelope is dropped.
+- It applies operations **strictly in sequence order**. A batch that arrives
+  early is buffered until its predecessor shows up; a gap means something was
+  lost, and the client asks for the full state instead of guessing.
+- **No optimistic apply.** The client does not apply its own operations when
+  it creates them — it waits for the gateway to echo them back. The price is a
+  round trip on every edit; the benefit is that the scene is always a prefix
+  of the server's history, so two replicas cannot drift apart.
+- On reconnect the client sends `sync {snapshotSeq, opIds}`; the gateway
+  acknowledges the operations it already has and sends the current state, and
+  the client re-sends only what is missing.
+- The hybrid logical clock (`shared/src/hlc.ts`) stamps every envelope, so
+  the operation log keeps a causal order even before the CRDT needs one.
+
+### 14.3 What "naive LWW" costs
+
+The merge is `applyOps` in arrival order — the last write to a property wins.
+That is convergent (every replica ends with the same scene) but it is **not
+conflict-free**:
+
+| Situation                                     | Stage 2 behaviour                                        |
+| --------------------------------------------- | -------------------------------------------------------- |
+| Two users drag the same rect at the same time | One drag is lost; the winner depends on arrival order    |
+| Two users set different properties            | No conflict — the properties are independent             |
+| Two users create an object at the same time   | Both survive, but their z-order depends on arrival order |
+| A client is offline for a minute              | Its edits are lost: they never reach the gateway         |
+
+The first and the last row are the reason stage 3 exists. A CRDT merge
+decides the winner by a deterministic total order (the HLC), not by who the
+server happened to hear first, and it merges histories that never met.
+
+While the connection is down the editor keeps behaving like stage 1: the
+operations are applied locally and never queued, so they are lost when the
+client reconnects and re-syncs to the room. A durable offline outbox is
+stage 5.
+
+### 14.4 How it is tested
+
+| Test                                         | What it proves                                                                                                                                 |
+| -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `server/src/rooms.test.ts`                   | The merge semantics: arrival order wins, duplicates are dropped, the sequence advances once per batch                                          |
+| `server/src/gateway.test.ts`                 | Two real WebSocket clients: join, broadcast, ack, identity stamping, room isolation                                                            |
+| `client/src/net/syncClient.test.ts`          | The client against an injected socket: ordering, the outbox, reconnect and re-sync                                                             |
+| `client/src/store/sceneStore.test.ts`        | The store in connected mode: it sends instead of applying, and the undo stack follows the gateway                                              |
+| `shared/src/hlc.test.ts`, `protocol.test.ts` | The clock never goes backwards; a malformed frame is rejected, not coerced                                                                     |
+| `scripts/sync-smoke.mjs`                     | Two real browser pages on one canvas: an edit in one shows up in the other, both converge, undo travels, the clients survive a gateway restart |
+
+The stage 2 checklist:
+
+- [x] WebSocket gateway (`ws`), room join/leave
+- [x] Operations broadcast to the room, acknowledged to the author
+- [x] Server-assigned client ids — the client cannot forge an identity
+- [x] Reconnect with a re-sync (`sync {snapshotSeq, opIds}`), no lost or duplicated operations
+- [x] Naive server-arrival-order LWW sync, convergent by construction
+- [x] Two browsers on one canvas (verified by the two-browser smoke test)
+
+---
+
+## 14. Roadmap
 
 | Stage    | Milestone                                                             | Exit criterion                         |
 | -------- | --------------------------------------------------------------------- | -------------------------------------- |
 | 0        | Monorepo, compose, CI, design doc, shared types                       | CI green; compose healthy              |
-| 1 (this) | Canvas, transform maths, operation pipeline, undo/redo                | 500 objects at 60 fps; ops only        |
-| 2        | WS gateway, naive LWW sync                                            | Two browsers move a rect live          |
+| 1        | Canvas, transform maths, operation pipeline, undo/redo                | 500 objects at 60 fps; ops only        |
+| 2 (this) | WS gateway, naive LWW sync                                            | Two browsers move a rect live          |
 | 3        | Full CRDT (RGA, tombstones), presence/cursors, convergence fuzz tests | 10 000 randomized schedules converge   |
 | 4        | Redis pub/sub sharding, Postgres op log + snapshots, JWT rooms        | 2 gateways in sync; restart-safe       |
 | 5        | Offline outbox, per-user undo/redo, version restore, k6 load tests    | p95 < 80 ms @ 200 users; 0 lost writes |

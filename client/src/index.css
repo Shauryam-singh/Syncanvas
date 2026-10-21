@@ -298,6 +298,46 @@ kbd {
   color: var(--text);
 }
 
+.status-bar__connection {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text);
+}
+
+.status-bar__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+
+.status-bar__connection--live .status-bar__dot {
+  background: #22c55e;
+  box-shadow: 0 0 0 3px rgb(34 197 94 / 20%);
+}
+
+.status-bar__connection--connecting .status-bar__dot {
+  background: #f59e0b;
+}
+
+.status-bar__connection--offline .status-bar__dot {
+  background: #ef4444;
+}
+
+.status-bar__peers {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.status-bar__peer {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
 .status-bar__spacer {
   flex: 1;
 }

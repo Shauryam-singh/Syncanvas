@@ -1,5 +1,6 @@
 import { createServer } from 'node:http';
 import { config } from './config.js';
+import { createGateway } from './gateway.js';
 
 const server = createServer((req, res) => {
   if (req.url === '/healthz') {
@@ -11,6 +12,15 @@ const server = createServer((req, res) => {
   res.end(JSON.stringify({ error: 'not_found' }));
 });
 
+createGateway(server, { path: config.wsPath });
+
 server.listen(config.port, () => {
-  console.log(`syncanvas server listening on http://localhost:${config.port}`);
+  console.log(
+    `syncanvas gateway listening on http://localhost:${config.port} (ws: ${config.wsPath})`,
+  );
+});
+
+process.on('SIGINT', () => {
+  console.log('\nshutting down');
+  server.close(() => process.exit(0));
 });

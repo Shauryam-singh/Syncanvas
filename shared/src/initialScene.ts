@@ -1,8 +1,13 @@
-import { createSceneObject, type SceneObject } from '@syncanvas/shared';
+import { createSceneObject, type SceneObject } from './object.js';
 
 /**
- * The scene the editor starts with — a few objects so the canvas is never
- * an empty void on first load.
+ * The scene a room starts with — a few objects so the canvas is never an
+ * empty void on first load.
+ *
+ * It lives in `shared` because both sides need the same seed: the client
+ * renders it while it is offline, and the gateway materialises it when a
+ * room is created. Both derive the same starting state, so a client that
+ * joins a fresh room sees no change.
  */
 export function createInitialScene(): SceneObject[] {
   return [
