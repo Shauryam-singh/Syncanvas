@@ -25,7 +25,7 @@ export type SceneObjectProp = keyof SceneObject;
  * Property names that are mutated independently by the LWW-map CRDT.
  *
  * `id` and `type` are immutable by construction and `zIndex` is *derived* from
- * the z-order sequence (an RGA in stage 3), so neither is a register.
+ * the z-order sequence (the CRDT RGA), so neither is a register.
  */
 export const MUTABLE_PROPS = [
   'x',

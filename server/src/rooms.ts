@@ -1,12 +1,13 @@
 import {
-  applyOps,
+  createDoc,
   createInitialScene,
-  createSceneState,
+  mergeEnvelopes,
   serializeScene,
+  toSceneState,
   type OpEnvelope,
   type PeerPresence,
+  type SceneDoc,
   type SceneObject,
-  type SceneState,
 } from '@syncanvas/shared';
 
 /** A client that has joined a room. */
@@ -21,19 +22,17 @@ export interface RoomMember {
 
 export interface Room {
   id: string;
-  /** The materialised scene — the single source of truth for the room. */
-  scene: SceneState;
-  /** Sequence number of the last accepted batch. */
+  /**
+   * The replicated document — the single source of truth for the room.
+   *
+   * The gateway no longer decides who wins: every accepted operation is
+   * merged with the CRDT, so the state depends only on the set of operations
+   * the room has seen, not on the order they arrived in.
+   */
+  doc: SceneDoc;
+  /** Sequence number of the last accepted batch (the broadcast watermark). */
   seq: number;
   members: Map<string, RoomMember>;
-  /**
-   * Ids of every operation that was applied to this room.
-   *
-   * This is the replay guard: a client that reconnects and re-sends its
-   * outbox must not apply those operations twice. Stage 4 moves the set into
-   * Postgres (`UNIQUE (room_id, op_key)`); here it lives in memory.
-   */
-  seenOpIds: Set<string>;
 }
 
 export interface ApplyResult {
@@ -65,10 +64,9 @@ export class RoomRegistry {
     if (existing) return existing;
     const room: Room = {
       id: roomId,
-      scene: createSceneState(createInitialScene()),
+      doc: createDoc(createInitialScene()),
       seq: 0,
       members: new Map(),
-      seenOpIds: new Set(),
     };
     this.rooms.set(roomId, room);
     return room;
@@ -102,30 +100,32 @@ export class RoomRegistry {
   /**
    * Merges a batch of operations into the room.
    *
-   * This is the *naive* last-writer-wins merge: the operations are applied in
-   * the order the gateway received them, and the last write to a property
-   * wins. There is no timestamp comparison and no intent preservation —
-   * exactly the behaviour stage 3 replaces with a real CRDT.
+   * The merge is the CRDT's: a property keeps the write with the greatest
+   * `(HLC, opId)`, the z-order is an RGA, and a delete tombstones its object.
+   * Two replicas that have seen the same operations hold the same document,
+   * whatever order the gateway received them in.
+   *
+   * The sequence number is still assigned per accepted batch because the wire
+   * protocol uses it for acknowledgement and catch-up — it is a broadcast
+   * watermark, not a merge rule.
    */
   applyOps(roomId: string, envelopes: readonly OpEnvelope[]): ApplyResult {
     const room = this.ensureRoom(roomId);
     const accepted: OpEnvelope[] = [];
     const duplicates: string[] = [];
+    const inBatch = new Set<string>();
 
     for (const envelope of envelopes) {
-      if (room.seenOpIds.has(envelope.id)) {
+      if (room.doc.seen.has(envelope.id) || inBatch.has(envelope.id)) {
         duplicates.push(envelope.id);
         continue;
       }
-      room.seenOpIds.add(envelope.id);
+      inBatch.add(envelope.id);
       accepted.push(envelope);
     }
 
     if (accepted.length > 0) {
-      room.scene = applyOps(
-        room.scene,
-        accepted.map((envelope) => envelope.op),
-      );
+      room.doc = mergeEnvelopes(room.doc, accepted);
       room.seq += 1;
     }
 
@@ -137,7 +137,7 @@ export class RoomRegistry {
     const room = this.ensureRoom(roomId);
     return {
       snapshotSeq: room.seq,
-      objects: serializeScene(room.scene),
+      objects: serializeScene(toSceneState(room.doc)),
     };
   }
 

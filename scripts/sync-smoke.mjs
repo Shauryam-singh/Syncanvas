@@ -3,7 +3,7 @@
  *
  * Opens two browser pages on the same room and checks that an edit in one
  * page shows up in the other, that both pages converge on the same scene,
- * that the gateway really is the ordering point and that the clients survive
+ * that the gateway merges and broadcasts, and that the clients survive
  * a gateway restart.
  *
  * The script starts the gateway itself (on :8099 by default) so it can kill

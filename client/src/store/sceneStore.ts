@@ -1,19 +1,26 @@
 import { create } from 'zustand';
 import {
   applyOps,
+  createDoc,
+  createHlc,
   createInitialScene,
   createSceneObject,
-  createSceneState,
   getObjectsInOrder,
   invertOp,
+  mergeEnvelopes,
   moveObject,
   resizeObject,
   rotateObject,
+  tickHlc,
+  toSceneState,
+  type HlcTimestamp,
   type MutableProp,
   type Op,
+  type OpEnvelope,
   type PeerPresence,
   type Point,
   type ResizeHandle,
+  type SceneDoc,
   type SceneObject,
   type SceneObjectType,
   type SceneState,
@@ -72,7 +79,10 @@ export interface UndoEntry {
 }
 
 export interface SceneStore {
+  /** The editor's view model, projected from `doc` after every merge. */
   scene: SceneState;
+  /** The replicated document — the CRDT state behind the scene. */
+  doc: SceneDoc;
   selection: string[];
   tool: Tool;
   /** The gesture currently in progress, if any. */
@@ -91,8 +101,8 @@ export interface SceneStore {
 
   /** Applies operations as a single undoable step. */
   dispatch: (ops: Op[]) => void;
-  /** Applies operations the gateway confirmed, in the gateway's order. */
-  applyServerOps: (ops: Op[], meta: { mine: boolean; undoable: boolean }) => void;
+  /** Merges the operations the gateway broadcast, with their CRDT stamps. */
+  applyServerOps: (envelopes: OpEnvelope[], meta: { mine: boolean; undoable: boolean }) => void;
   setTool: (tool: Tool) => void;
   setSelection: (ids: string[]) => void;
   toggleSelection: (id: string) => void;
@@ -170,8 +180,34 @@ const DEFAULT_FILL: Record<SceneObjectType, string> = {
   text: '#0f172a',
 };
 
+/**
+ * The clock used for edits made while there is no gateway.
+ *
+ * In live mode the sync client stamps the operations instead (it has the
+ * server-assigned actor id); here a single local actor is enough, because
+ * these operations never leave this replica.
+ */
+let localClock: HlcTimestamp = createHlc('local');
+let localSequence = 0;
+
+function stampLocal(ops: readonly Op[]): OpEnvelope[] {
+  return ops.map((op) => {
+    localClock = tickHlc(localClock, 'local');
+    localSequence += 1;
+    return {
+      id: `local_${localSequence}`,
+      actorId: 'local',
+      hlc: localClock,
+      op,
+    };
+  });
+}
+
+const initialDoc = createDoc(createInitialScene());
+
 export const useSceneStore = create<SceneStore>((set, get) => ({
-  scene: createSceneState(createInitialScene()),
+  scene: toSceneState(initialDoc),
+  doc: initialDoc,
   selection: [],
   tool: 'select',
   interaction: null,
@@ -186,35 +222,43 @@ export const useSceneStore = create<SceneStore>((set, get) => ({
     if (ops.length === 0) return;
     const sender = get().opSender;
     if (sender) {
-      // Connected: the gateway owns the order. The operation is sent and
-      // applied when it comes back, so every replica folds the same history.
+      // Connected: the operation is stamped, sent, and merged when the
+      // gateway echoes it back — the same path as everybody else's edits.
       sender(ops, { undoable: true });
       return;
     }
-    set((state) => ({
-      scene: applyOps(state.scene, ops),
-      // The inverses are computed against the state *before* the operations
-      // were applied — that is the only state they can undo.
-      undoStack: [...state.undoStack, { ops, inverses: invertGroup(state.scene, ops) }],
-      redoStack: [],
-    }));
+    const envelopes = stampLocal(ops);
+    set((state) => {
+      const doc = mergeEnvelopes(state.doc, envelopes);
+      return {
+        doc,
+        scene: toSceneState(doc),
+        // The inverses are computed against the state *before* the operations
+        // were applied — that is the only state they can undo.
+        undoStack: [...state.undoStack, { ops, inverses: invertGroup(state.scene, ops) }],
+        redoStack: [],
+      };
+    });
   },
 
-  applyServerOps: (ops, meta) => {
-    if (ops.length === 0) return;
+  applyServerOps: (envelopes, meta) => {
+    if (envelopes.length === 0) return;
+    const ops = envelopes.map((envelope) => envelope.op);
     set((state) => {
-      const scene = applyOps(state.scene, ops);
+      const doc = mergeEnvelopes(state.doc, envelopes);
+      const scene = toSceneState(doc);
       if (!meta.mine) {
         // Somebody else's edit: it changes the scene but it is not part of
         // this user's history and cannot be undone by them.
-        return { scene };
+        return { doc, scene };
       }
       if (!meta.undoable) {
         // The confirmation of an undo or a redo: the stacks were already
         // updated when the action was triggered.
-        return { scene };
+        return { doc, scene };
       }
       return {
+        doc,
         scene,
         undoStack: [...state.undoStack, { ops, inverses: invertGroup(state.scene, ops) }],
         redoStack: [],
@@ -341,8 +385,10 @@ export const useSceneStore = create<SceneStore>((set, get) => ({
   },
 
   loadScene: (objects) => {
+    const doc = createDoc(objects);
     set({
-      scene: createSceneState(objects),
+      doc,
+      scene: toSceneState(doc),
       selection: [],
       undoStack: [],
       redoStack: [],
@@ -483,7 +529,7 @@ export const useSceneStore = create<SceneStore>((set, get) => ({
   cancelInteraction: () => set({ interaction: null, draft: [] }),
 
   undo: () => {
-    const { scene, undoStack, redoStack, opSender } = get();
+    const { undoStack, redoStack, opSender } = get();
     const entry = undoStack[undoStack.length - 1];
     if (!entry) return;
     if (opSender) {
@@ -496,15 +542,20 @@ export const useSceneStore = create<SceneStore>((set, get) => ({
       opSender(entry.inverses, { undoable: false });
       return;
     }
-    set({
-      scene: applyOps(scene, entry.inverses),
-      undoStack: undoStack.slice(0, -1),
-      redoStack: [...redoStack, entry],
+    const envelopes = stampLocal(entry.inverses);
+    set((state) => {
+      const doc = mergeEnvelopes(state.doc, envelopes);
+      return {
+        doc,
+        scene: toSceneState(doc),
+        undoStack: undoStack.slice(0, -1),
+        redoStack: [...redoStack, entry],
+      };
     });
   },
 
   redo: () => {
-    const { scene, undoStack, redoStack, opSender } = get();
+    const { undoStack, redoStack, opSender } = get();
     const entry = redoStack[redoStack.length - 1];
     if (!entry) return;
     if (opSender) {
@@ -515,10 +566,15 @@ export const useSceneStore = create<SceneStore>((set, get) => ({
       opSender(entry.ops, { undoable: false });
       return;
     }
-    set({
-      scene: applyOps(scene, entry.ops),
-      undoStack: [...undoStack, entry],
-      redoStack: redoStack.slice(0, -1),
+    const envelopes = stampLocal(entry.ops);
+    set((state) => {
+      const doc = mergeEnvelopes(state.doc, envelopes);
+      return {
+        doc,
+        scene: toSceneState(doc),
+        redoStack: redoStack.slice(0, -1),
+        undoStack: [...undoStack, entry],
+      };
     });
   },
 }));

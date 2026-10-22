@@ -5,3 +5,4 @@ export * from './geometry.js';
 export * from './scene.js';
 export * from './hlc.js';
 export * from './initialScene.js';
+export * from './crdt/index.js';

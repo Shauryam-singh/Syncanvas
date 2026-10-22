@@ -60,8 +60,8 @@ export function useSync(config?: SyncConfig): void {
       onState: ({ objects }) => {
         useSceneStore.getState().loadScene(objects);
       },
-      onOps: (ops, meta) => {
-        useSceneStore.getState().applyServerOps(ops, meta);
+      onOps: (envelopes, meta) => {
+        useSceneStore.getState().applyServerOps(envelopes, meta);
       },
       onPeers: (peers) => {
         useSceneStore.getState().setPeers(peers);

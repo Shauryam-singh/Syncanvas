@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { Op } from '@syncanvas/shared';
+import type { Op, OpEnvelope } from '@syncanvas/shared';
 import { SyncClient, type ConnectionState, type OpsMeta } from './syncClient';
 
 /** A WebSocket stand-in that records what the client sent. */
@@ -40,7 +40,7 @@ const SET_X: Op = { kind: 'setProp', objectId: 'demo-rect', prop: 'x', value: 42
 describe('the sync client', () => {
   let sockets: FakeSocket[];
   let states: ConnectionState[];
-  let applied: Array<{ ops: Op[]; meta: OpsMeta }>;
+  let applied: Array<{ envelopes: OpEnvelope[]; meta: OpsMeta }>;
   let client: SyncClient;
 
   beforeEach(() => {
@@ -57,7 +57,7 @@ describe('the sync client', () => {
         return socket as unknown as WebSocket;
       },
       onConnection: (state) => states.push(state),
-      onOps: (ops, meta) => applied.push({ ops, meta }),
+      onOps: (envelopes, meta) => applied.push({ envelopes, meta }),
     });
   });
 
@@ -140,7 +140,7 @@ describe('the sync client', () => {
 
     expect(applied).toHaveLength(1);
     expect(applied[0]?.meta.mine).toBe(false);
-    expect(applied[0]?.ops).toEqual([SET_X]);
+    expect(applied[0]?.envelopes.map((envelope) => envelope.op)).toEqual([SET_X]);
   });
 
   it('recognises its own operations when they come back', () => {
@@ -171,13 +171,13 @@ describe('the sync client', () => {
 
     sockets[0]?.receive({ t: 'ops', roomId: 'demo', seq: 1, ops: [envelope('op_1', 1)] });
     expect(applied).toHaveLength(2);
-    expect(applied[0]?.ops[0]).toEqual({
+    expect(applied[0]?.envelopes[0]?.op).toEqual({
       kind: 'setProp',
       objectId: 'demo-rect',
       prop: 'x',
       value: 1,
     });
-    expect(applied[1]?.ops[0]).toEqual({
+    expect(applied[1]?.envelopes[0]?.op).toEqual({
       kind: 'setProp',
       objectId: 'demo-rect',
       prop: 'x',

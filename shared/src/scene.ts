@@ -4,9 +4,9 @@ import type { SceneObject } from './object.js';
 /**
  * The scene is a set of objects plus an explicit z-order sequence.
  *
- * `order` is authoritative for layering (it is the sequence the RGA will
- * replace in stage 3); `zIndex` on each object is *materialised* from the
- * order so that snapshots and the wire format stay flat.
+ * `order` is authoritative for layering (the CRDT RGA owns it); `zIndex` on
+ * each object is *materialised* from the order so that snapshots and the wire
+ * format stay flat.
  *
  * Every mutation goes through `applyOp`. Nothing in the editor mutates an
  * object in place — that invariant is what makes undo, replay, offline
@@ -107,8 +107,8 @@ export function applyOp(state: SceneState, op: Op): SceneState {
     }
 
     case 'editText':
-      // Stage 3 replaces this with a per-character RGA merge. Until then the
-      // editor edits whole strings through `setProp('text', …)`.
+      // The per-character text RGA is stage 5. Until then the editor edits
+      // whole strings through `setProp('text', …)` and text is an LWW register.
       return state;
   }
 }

@@ -40,11 +40,11 @@ export interface GatewayOptions {
 /**
  * The WebSocket gateway.
  *
- * It owns exactly one thing: the order in which operations happen. Every
- * batch of operations is applied to the room in the order it arrives, and the
- * result is broadcast to the room in that same order. That single ordering
- * point is what makes the naive last-writer-wins merge of stage 2
- * *convergent* — every client folds the same sequence of operations.
+ * It owns the transport: identities, room membership, sequence numbers and
+ * fan-out. Every batch is merged into the room's CRDT document and broadcast
+ * to the room — the author included — so every replica merges the same set of
+ * envelopes. The sequence number is a broadcast watermark, not a merge rule:
+ * the winner of a conflict is decided by `(HLC, opId)` on every replica.
  */
 export function createGateway(
   server: HttpServer,
@@ -100,9 +100,9 @@ export function createGateway(
     const result = registry.applyOps(roomId, stamped);
 
     if (result.accepted.length > 0) {
-      // The author receives the broadcast too: applying every operation in
-      // server order — including its own — is what keeps all replicas
-      // byte-for-byte identical.
+      // The author receives the broadcast too. Every replica — including the
+      // author — merges the same envelopes through the same CRDT, which is
+      // what keeps them identical; the sequence number only orders the wire.
       broadcast(roomId, { t: 'ops', roomId, seq: result.seq, ops: result.accepted });
     }
 
@@ -132,7 +132,7 @@ export function createGateway(
 
   function handleSync(client: Client, roomId: string, opIds: readonly string[]): void {
     const room = registry.ensureRoom(roomId);
-    const known = opIds.filter((id) => room.seenOpIds.has(id));
+    const known = opIds.filter((id) => room.doc.seen.has(id));
     send(client, { t: 'ack', roomId, opIds: known, seq: room.seq });
     const snapshot = registry.snapshot(roomId);
     send(client, {

@@ -1,11 +1,34 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { createSceneState, getObjectsInOrder, type Op, type SceneObject } from '@syncanvas/shared';
+import {
+  createDoc,
+  createSceneState,
+  getObjectsInOrder,
+  type Op,
+  type OpEnvelope,
+  type SceneObject,
+} from '@syncanvas/shared';
 import { invertGroup, useSceneStore } from './sceneStore';
 
 const store = () => useSceneStore.getState();
 
+/** A monotonic clock for the confirmations the fake gateway sends back. */
+let testClock = 0;
+
+function envelopes(ops: readonly Op[]): OpEnvelope[] {
+  return ops.map((op) => {
+    testClock += 1;
+    return {
+      id: `test-${testClock}`,
+      actorId: 'test',
+      hlc: { wall: testClock, counter: 0, actorId: 'test' },
+      op,
+    };
+  });
+}
+
 function reset(objects: SceneObject[] = []) {
   useSceneStore.setState({
+    doc: createDoc(objects),
     scene: createSceneState(objects),
     selection: [],
     tool: 'select',
@@ -137,7 +160,7 @@ describe('connected mode', () => {
     reset([object]);
     const sent = connect();
     store().dispatch([{ kind: 'setProp', objectId: 'a', prop: 'x', value: 5 }]);
-    store().applyServerOps(sent[0]?.ops ?? [], { mine: true, undoable: true });
+    store().applyServerOps(envelopes(sent[0]?.ops ?? []), { mine: true, undoable: true });
 
     expect(store().scene.objects.get('a')?.x).toBe(5);
     expect(store().undoStack).toHaveLength(1);
@@ -145,7 +168,7 @@ describe('connected mode', () => {
 
   it('does not record an undo step for somebody else’s operation', () => {
     reset([object]);
-    store().applyServerOps([{ kind: 'setProp', objectId: 'a', prop: 'x', value: 5 }], {
+    store().applyServerOps(envelopes([{ kind: 'setProp', objectId: 'a', prop: 'x', value: 5 }]), {
       mine: false,
       undoable: false,
     });
@@ -158,7 +181,7 @@ describe('connected mode', () => {
     reset([object]);
     const sent = connect();
     store().dispatch([{ kind: 'setProp', objectId: 'a', prop: 'x', value: 5 }]);
-    store().applyServerOps(sent[0]?.ops ?? [], { mine: true, undoable: true });
+    store().applyServerOps(envelopes(sent[0]?.ops ?? []), { mine: true, undoable: true });
 
     store().undo();
     expect(sent).toHaveLength(2);
@@ -173,9 +196,9 @@ describe('connected mode', () => {
     reset([object]);
     const sent = connect();
     store().dispatch([{ kind: 'setProp', objectId: 'a', prop: 'x', value: 5 }]);
-    store().applyServerOps(sent[0]?.ops ?? [], { mine: true, undoable: true });
+    store().applyServerOps(envelopes(sent[0]?.ops ?? []), { mine: true, undoable: true });
     store().undo();
-    store().applyServerOps(sent[1]?.ops ?? [], { mine: true, undoable: false });
+    store().applyServerOps(envelopes(sent[1]?.ops ?? []), { mine: true, undoable: false });
 
     expect(store().scene.objects.get('a')?.x).toBe(0);
     expect(store().undoStack).toHaveLength(0);
@@ -186,7 +209,7 @@ describe('connected mode', () => {
     reset([object]);
     const sent = connect();
     store().dispatch([{ kind: 'setProp', objectId: 'a', prop: 'x', value: 5 }]);
-    store().applyServerOps(sent[0]?.ops ?? [], { mine: true, undoable: true });
+    store().applyServerOps(envelopes(sent[0]?.ops ?? []), { mine: true, undoable: true });
     store().undo();
     store().redo();
 

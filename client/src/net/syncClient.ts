@@ -34,7 +34,8 @@ export interface SyncClientOptions {
   createSocket?: (url: string) => WebSocket;
   onConnection?: (state: ConnectionState) => void;
   onState?: (payload: { objects: SceneObject[]; snapshotSeq: number }) => void;
-  onOps?: (ops: Op[], meta: OpsMeta) => void;
+  /** Broadcast operations, with the stamps the CRDT merge needs. */
+  onOps?: (envelopes: OpEnvelope[], meta: OpsMeta) => void;
   onPeers?: (peers: PeerPresence[]) => void;
   onError?: (message: string) => void;
 }
@@ -50,17 +51,16 @@ interface OutboxEntry {
 }
 
 /**
- * The client half of the stage 2 protocol.
+ * The client half of the sync protocol.
  *
- * The gateway is the single ordering point: operations are applied on the
- * server in the order it received them, and every client folds that same
- * order. This client therefore does **not** apply its own operations
- * optimistically — it waits for the server to echo them back, so that its
- * scene is always a prefix of the server's history.
+ * The gateway relays and sequences batches; the merge itself is the CRDT that
+ * every replica runs (see `shared/src/crdt/`). This client still does **not**
+ * apply its own operations optimistically — it waits for the server to echo
+ * the envelopes back, so that its scene is always a prefix of the replicated
+ * document and the undo stack has a single source of truth.
  *
- * The price is a round trip of latency on every edit; the benefit is that
- * the naive merge cannot diverge. That trade is the whole point of stage 2:
- * it shows exactly what the CRDT in stage 3 has to preserve.
+ * The price is a round trip of latency on every edit. Local-first apply is
+ * stage 5; the CRDT merge already supports it.
  */
 export class SyncClient {
   private readonly options: SyncClientOptions;
@@ -312,10 +312,7 @@ export class SyncClient {
     if (envelopes.length === 0) return;
     const mine = envelopes.every((envelope) => this.outbox.has(envelope.id));
     const undoable = mine && envelopes.every((envelope) => this.undoableIds.has(envelope.id));
-    this.options.onOps?.(
-      envelopes.map((envelope) => envelope.op),
-      { mine, undoable },
-    );
+    this.options.onOps?.(envelopes, { mine, undoable });
   }
 
   private requestResync(): void {

@@ -5,13 +5,9 @@ import type { HlcTimestamp } from './operations.js';
  *
  * A timestamp is `(wall, counter, actorId)`: wall time in milliseconds, a
  * logical counter that breaks ties inside one millisecond, and the replica
- * that produced it. Together they form a total order that is consistent with
- * causality and needs no central clock — the property stage 3 relies on when
- * it replaces the naive merge with an LWW-map.
- *
- * Stage 2 only *stamps* operations with this clock; the merge is still
- * "whatever the gateway received last wins". The clock is here so the wire
- * format is already the one the CRDT will use.
+ * that produced it. The CRDT orders writes by this clock plus the operation
+ * id (see `crdt/register.ts`), so the order is consistent with causality and
+ * needs no central clock.
  */
 
 /** Creates the first timestamp of a replica. */

@@ -59,27 +59,28 @@ semantics; it is intended to evolve into the public README as the project ships.
                      │ - snapshots / versions  │
                      └─────────────────────────┘
 
-   Client (React + Vite): local CRDT apply → optimistic render → send ops
+   Client (React + Vite): CRDT merge → project → render (optimistic apply is stage 5)
 ```
 
-**Request flow for an edit (stage 2 — what is implemented today)**
+**Request flow for an edit (stage 3 — what is implemented today)**
 
 1. User drags a rect. The client renders a transient _draft_ while the pointer
    moves and turns the finished gesture into one or two operations.
 2. The client stamps the operations with its HLC, puts the envelopes in its
    outbox and sends an `ops` batch over the WebSocket. It does **not** apply
-   them locally — the gateway decides the order.
+   them locally yet — the author waits for the echo.
 3. The gateway stamps the envelopes with its own identity for the actor,
-   applies the batch to the room state, assigns it the next sequence number
-   and broadcasts it to the room — the author included.
-4. Every client folds the operations in sequence order, so all replicas end
-   with the same scene. The author applies its own operations at the same
-   moment as everybody else, which is what keeps the replicas identical.
+   merges the batch into the room's CRDT document (order-independent),
+   assigns the batch the next sequence number as a broadcast watermark, and
+   broadcasts it to the room — the author included.
+4. Every client merges the same envelopes into its own document and projects
+   the result. Because the merge is commutative, delivery order does not
+   matter; all replicas reach the same scene.
 5. The gateway acknowledges the batch; the client drops the envelopes from
    its outbox. A client that reconnects sends `sync {snapshotSeq, opIds}` and
    re-sends only what the gateway is missing.
 
-**Request flow for an edit (stage 4 — the target architecture)**
+**Request flow for an edit (stage 5 — the target architecture)**
 
 1. User drags a rect. Client mutates its local CRDT state and renders
    immediately (optimistic, never blocked on network).
@@ -93,12 +94,13 @@ semantics; it is intended to evolve into the public README as the project ships.
 5. A snapshot worker folds the op log into a snapshot every N ops / T seconds
    and compacts the log.
 
-> **The gap between the two flows is the point of the project.** Stage 2 orders
-> operations centrally, which is convergent but pays a round trip on every
-> edit and cannot merge two offline histories. Stage 3 replaces the ordering
-> point with an order-independent merge, which removes the round trip and makes
-> offline editing possible — at the price of having to get the CRDT right.
-> §13 measures what stage 2 costs.
+> **The gap between the two flows is the point of the project.** Stage 2 ordered
+> operations centrally, which converged but paid a round trip on every edit and
+> could not merge two offline histories. Stage 3 replaced the ordering point
+> with an order-independent merge: conflicts now resolve by version, not by
+> arrival order, and the gateway is a relay rather than an arbiter. What
+> remains for stage 5 is applying locally _before_ the echo, keeping the outbox
+> in IndexedDB, and persisting the log. §13 measures what stage 2 cost.
 
 ---
 
@@ -106,16 +108,16 @@ semantics; it is intended to evolve into the public README as the project ships.
 
 Defined in `shared/src/object.ts`, consumed by client, server and tests.
 
-| Field      | Type                                      | Notes                                             |
-| ---------- | ----------------------------------------- | ------------------------------------------------- |
-| `id`       | `string`                                  | Client-generated UUID, stable for object lifetime |
-| `type`     | `'rect' \| 'ellipse' \| 'line' \| 'text'` | Discriminated union for rendering                 |
-| `x`, `y`   | `number`                                  | Top-left in scene coordinates                     |
-| `w`, `h`   | `number`                                  | Size (rotation-independent)                       |
-| `rotation` | `number`                                  | Degrees, around center                            |
-| `fill`     | `string`                                  | CSS color                                         |
-| `zIndex`   | `number`                                  | Derived from the RGA z-order sequence             |
-| `text`     | `string?`                                 | Only for `type: 'text'`; merged via RGA per char  |
+| Field      | Type                                      | Notes                                                     |
+| ---------- | ----------------------------------------- | --------------------------------------------------------- |
+| `id`       | `string`                                  | Client-generated UUID, stable for object lifetime         |
+| `type`     | `'rect' \| 'ellipse' \| 'line' \| 'text'` | Discriminated union for rendering                         |
+| `x`, `y`   | `number`                                  | Top-left in scene coordinates                             |
+| `w`, `h`   | `number`                                  | Size (rotation-independent)                               |
+| `rotation` | `number`                                  | Degrees, around center                                    |
+| `fill`     | `string`                                  | CSS color                                                 |
+| `zIndex`   | `number`                                  | Derived from the RGA z-order sequence                     |
+| `text`     | `string?`                                 | Only for `type: 'text'`; LWW now, per-char RGA in stage 5 |
 
 The mutable property set (`MUTABLE_PROPS`) is an explicit allowlist: the CRDT
 never accepts a `setProp` for `id` or `type`, so identity is immutable and
@@ -125,82 +127,144 @@ convergence bugs from "type races" are impossible by construction.
 
 ## 4. CRDT design
 
-Implemented in `shared/src/crdt/` (stage 1–2). Three small CRDTs cover the
-whole editor:
+Implemented in `shared/src/crdt/` (stage 3) with no dependencies. Three small
+pieces compose into the whole editor: a versioned register, a sequence, and a
+document that ties them to the operation log.
 
-### 4.1 Hybrid logical clocks (HLC)
+### 4.1 Versions: HLC plus operation id
 
-Every op carries `{wall, counter, actorId}`.
+Every operation travels as an envelope
+`{id, actorId, hlc: {wall, counter, actorId}, op}`. Writes are compared by a
+**version**:
 
-- `wall`: local clock ms, clamped to `maxClockDriftMs` (default 5 s) — a badly
-  skewed client cannot time-travel writes into the far future.
-- `counter`: increments when two events land in the same millisecond.
-- `actorId`: deterministic tie-break.
+```
+version(op) = (hlc.wall, hlc.counter, hlc.actorId, op.id)
+```
 
-Ordering is the lexicographic total order `(wall, counter, actorId)`,
-implemented once as `compareHlc` and used by every merge path. HLC gives us
-causality ("B sees A's effect ⇒ A < B") while staying close to wall time, so
-LWW resolves in the order a human would expect ("latest edit wins").
+`compareStamps` (`register.ts`) implements that order once and every merge path
+uses it. The HLC supplies causality and a human-meaningful "latest edit wins";
+the operation id is a final tie-break that is unique per operation, so even two
+edits stamped at exactly the same logical instant resolve identically on every
+replica.
+
+`tickHlc` moves the wall clock forward (or keeps it) and bumps the counter
+inside a millisecond. `receiveHlc` moves the local clock strictly past every
+remote timestamp it observes, so a client that has seen A's edit always stamps
+its next edit after A. There is deliberately **no clamping**: clamping would
+break "receive is strictly after send" and with it causality. The price is that
+a client whose wall clock is 10 minutes fast drags the room's logical clock
+forward when the others receive its operations — but only until they have
+observed them, after which their own edits overtake it (§4.5, §14.1).
 
 ### 4.2 LWW-map for object properties
 
-Scene state is `Map<objectId, ObjectState>` where each mutable property is an
-independent last-writer-wins register:
-
-```
-setProp(objectId, prop, value, hlc):
-  if objectId not in state: drop (op lost the create race) or buffer
-  if hlc > register[prop].hlc:  register[prop] = {value, hlc}
-```
+The document stores one `ObjectRecord` per object id. Each mutable property has
+an independent register `{value, hlc, opId}`; a write replaces the register only
+when its version is greater.
 
 - **Per-property registers**, not per-object: two users dragging different
-  properties of the same rect (e.g. `x` vs `fill`) never conflict at all.
-- **Create/delete** is itself an LWW register over a tombstone bit. A
-  `deleteObject` with a greater HLC tombstones the object; later `setProp`
-  ops with smaller HLCs are dropped against the tombstone, so a slow client
-  cannot resurrect a deleted object. Delete is not compactable until the op
-  log is snapshotted past all in-flight replicas.
-- **Conflict policy**: LWW is "unfair" (the late writer's value wins even if
-  it overwrote a newer semantic intent). For a canvas where properties are
-  small, continuous and user-driven this is the right tradeoff — see §10.
+  properties of the same rect (`x` vs `fill`) never conflict at all.
+- **Any op creates the record.** A `setProp` or `deleteObject` whose
+  `createObject` has not arrived yet creates a record with `birth: null`. The
+  record is invisible until the create lands, but the write is already stored,
+  so it survives the wait. This is what makes delivery order irrelevant.
+- **Create is a register too.** `birth` holds the object's `type`, versioned
+  by the create's stamp. The create's mutable properties are registers at the
+  same version, so a later `setProp` wins and an older, late create cannot
+  clobber newer properties.
+- **Existence is delete-wins.** An object is alive when it has a birth and
+  either no death, or a birth strictly later than the death in
+  `(wall, counter)` — the actor id is ignored for existence, so an exact
+  logical-time tie goes to the tombstone. A delete followed by a new create
+  (what undo emits) has a strictly later birth and **resurrects** the object;
+  a late `setProp` can never resurrect it.
+- **Conflict policy**: LWW is "unfair" — the later writer wins even if it
+  overrode a newer semantic intent. For a canvas whose properties are small,
+  continuous and user-driven, this is the right tradeoff; see §10.
+
+Registers and records are immutable values, so a merge returns a new document
+and reuses every record it did not touch.
 
 ### 4.3 RGA for z-order
 
-Layer order is an RGA (Replicated Growable Array) of object ids:
+Layer order is an RGA (Replicated Growable Array) of object ids. Each object has
+at most **one** placement entry (`OrderEntry`), so moving it replaces its
+previous placement instead of leaving a duplicate in the sequence.
 
-- `insertZOrder(objectId, afterId)` inserts after `afterId` (beginning of the
-  sequence when null).
-- Concurrent inserts after the same origin are ordered by the HLC total order,
-  so every replica produces the identical sequence.
-- `zIndex` on each object is materialised from the sequence index (it is
-  derived state, not a register — users do not edit it directly).
+A placement's **origin** is one of three things:
 
-**Stage 1 note.** The RGA itself lands in stage 3. Stage 1 keeps the same
-_shape_ — an explicit order array that owns the layering — but fills it with a
-naive rule: a new object is appended on top, and `insertZOrder` moves an
-object relative to a neighbour. The consequence is documented and tested:
-property writes are order independent, but **structural operations are not**
-(two concurrent creates stack differently depending on arrival order). That
-gap is exactly what the RGA plus HLC tie-break closes in stage 3, and it is the
-"why CRDT" story the project is built around.
+| Origin                          | Meaning                 | Emitted by                     |
+| ------------------------------- | ----------------------- | ------------------------------ |
+| `{kind: 'top'}`                 | the top of the stack    | `createObject` (implicitly)    |
+| `{kind: 'bottom'}`              | the bottom of the stack | `insertZOrder(objectId, null)` |
+| `{kind: 'after', objectId: id}` | immediately above `id`  | `insertZOrder(objectId, id)`   |
+
+The two stack ends cannot share the `null` origin: a new object is appended on
+**top**, while `insertZOrder(objectId, null)` has always meant "send to
+**back**". Keeping both as explicit origins preserves the stage-1 contract
+without making creation land at the bottom.
+
+The sequence is a depth-first walk of the origin tree. Sibling order is a pure
+function of the entries' versions:
+
+- **top roots, ascending** — the newest object is emitted last, so it is drawn
+  on top;
+- **bottom roots, descending** — the most recent "send to back" is the
+  bottom-most;
+- **children of an `after` origin, descending** — the most recent move lands
+  immediately above its origin.
+
+Two robustness rules make the walk total:
+
+- **Dead nodes stay as hinges.** A deleted object is skipped in the output but
+  still walked, so the objects placed above it keep their relative position.
+- **Cycles are broken deterministically.** Moving A after B and B after A
+  creates a cycle with no natural root. After the root walk, the entries it
+  never reached are emitted one component at a time, smallest version first, so
+  every replica breaks the cycle the same way.
+
+`zIndex` is materialised from the walk's index on every projection. It is
+derived state, never a register: users move the sequence, not the number.
 
 ### 4.4 RGA for text
 
-Each text object owns a per-character RGA. `editText` carries
-`{afterCharId, insert?, deleteCount?}`:
+`editText` carries `{afterCharId, insert?, deleteCount?}` and is reserved for a
+per-character RGA: concurrent typing at the same cursor interleaves
+deterministically instead of one user's whole string clobbering another's.
 
-- Concurrent typing at the same cursor interleaves deterministically instead
-  of one user's whole string clobbering another's (which is what a naive
-  `setProp('text', ...)` would do).
-- Characters are keyed by `{actorId}-{counter}` so keys are unique and
-  globally ordered; deletions become tombstones trimmed at compaction.
+In stage 3 the operation is validated and remembered — so its id stays
+idempotent, and the wire format does not change later — but the projection
+ignores it. Text is still an LWW register over the whole string. The generic
+RGA in `rga.ts` is the structure the per-character version will reuse (origins
+are character keys, deletions are tombstones); that lands in stage 5.
 
 **Why not Yjs?** Rolling our own is a deliberate scope choice: the LWW-map +
-RGA + HLC core is ~300 lines, is fully testable with fuzz tests, and is the
-artifact that proves we understand _why_ Yjs works (order-independent merge,
-tombstones, deterministic tie-breaks). See §10 for the tradeoff.
+RGA + HLC core is a few hundred lines, is fully testable with property-based
+tests, and is the artifact that proves we understand _why_ Yjs works
+(order-independent merge, tombstones, deterministic tie-breaks). See §10 for the
+tradeoff.
 
-### 4.5 Undo/redo (per user)
+### 4.5 How the merge is verified
+
+The stage-3 tests are the most important in the project:
+
+| File                  | What it proves                                                                                                                                    |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `register.test.ts`    | Total order, operation-id tie-break, idempotence, null handling                                                                                   |
+| `rga.test.ts`         | Top/bottom origins, moves, dead hinges, cycles, deterministic sibling order, placement LWW                                                        |
+| `doc.test.ts`         | Out-of-order set/delete/placement, tie-breaks, delete-wins, undo resurrection, projection, seed parity                                            |
+| `convergence.test.ts` | 10,000 randomized schedules: 2–5 clients, shuffled delivery with duplicates, identical `docFingerprint` and projected scene on every replica      |
+| `convergence.test.ts` | An independent **oracle**: every register equals the maximum-version write, computed outside the merge                                            |
+| `convergence.test.ts` | Clock skew: a client 10 minutes ahead wins its first edit, then loses to every client that observed it; delivery order does not change the result |
+
+The oracle matters because a convergence test alone would happily accept a
+consistently _wrong_ merge rule — all replicas would agree on the wrong value.
+The oracle and the skew test pin the semantics, while the 10,000-schedule test
+pins agreement. fast-check shrinks any failing schedule to a minimal
+counterexample. The full property suite runs in about one second, so CI runs it
+on every build instead of sampling it.
+
+### 4.6 Undo/redo (per user)
 
 Per-user inverse operations, not global state history:
 
@@ -211,7 +275,7 @@ Per-user inverse operations, not global state history:
   edit (last undo wins), rather than "each undoes only their own change in
   isolation". Documented, tested, accepted.
 
-### 4.6 Version history and restore
+### 4.7 Version history and restore
 
 Snapshots (§7) double as named versions. **Restore** is emitted as a diff: the
 server computes `current → snapshot` and materialises `setProp` /
@@ -265,23 +329,23 @@ stamps every envelope it accepts with the identity of the socket that sent it.
 }
 ```
 
-**The stage 2 invariant is total order, not order independence.** The gateway
-is the single ordering point: it applies each batch in the order it arrives
-and stamps it with the next sequence number. Every client folds the
-operations in that sequence, so all replicas converge — but the winner of two
-conflicting writes is decided by _arrival order_, not by the merge. This is
-deliberately the naive behaviour stage 2 asks for, and it is what makes the
-limitations visible:
+**The stage-3 invariant is order independence, not a central order.** The
+gateway still assigns every accepted batch the next sequence number, but that
+number is a **broadcast watermark**: it is used to acknowledge the author and to
+replay what a reconnecting client missed. It is not a merge rule. The gateway
+merges the batch into the room's CRDT document, and every client merges the
+same envelopes into its own document; the winner of a conflict is
+`(HLC, opId)` on every replica, regardless of arrival order (§4.1–4.2).
 
-- two users drag the same rectangle at the same time → one drag is silently
-  discarded, and which one depends on who the gateway heard first;
-- an offline client cannot merge its history with anybody else's, because its
-  operations were never in the gateway's order.
+- two users drag the same rectangle at the same time → the later write wins on
+  every replica, and both clients see the same outcome;
+- a client that reconnects can merge its history with the room's, because the
+  merge no longer depends on a single delivery order.
 
-Replayed batches after a reconnect are deduped by `op.id`, so a client that
-re-sends its outbox cannot apply anything twice. Stage 3 replaces the
-ordering point with an order-independent merge (§4.2), which is what makes
-concurrent edits safe and offline editing possible.
+Replayed batches after a reconnect are deduped by `op.id` (the document keeps a
+`seen` set), so a client that re-sends its outbox cannot apply anything twice.
+Catch-up currently starts from a **projected snapshot** rather than the full
+CRDT history; §13 lists what that costs.
 
 ---
 
@@ -351,10 +415,10 @@ watermark of the oldest named version.
 - Trigger: every **1 000 ops** or **5 minutes** of activity per room.
 - Single-writer: a Redis `SET NX PX` lock (`lock:snapshot:{roomId}`, 10 s TTL)
   ensures only one gateway snapshots a room; others skip.
-- Writer folds `snapshot + ops` through the same pure `applyOp` used by clients
-  — the snapshot cannot drift from live state because there is one merge
-  implementation.
-- Named versions = snapshots with `created_by` set; restore per §4.6.
+- Writer folds `snapshot + ops` through the same `mergeEnvelopes` (and the same
+  projection) used by the gateway and the clients — the snapshot cannot drift
+  from live state because there is one merge implementation.
+- Named versions = snapshots with `created_by` set; restore per §4.7.
 
 ---
 
@@ -399,19 +463,22 @@ tests that randomly partition clients).
 
 ## 10. Design decisions and tradeoffs
 
-| Decision                                       | Why                                                                        | Cost                                                                             |
-| ---------------------------------------------- | -------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
-| Hand-rolled LWW-map + RGA + HLC instead of Yjs | Proves CRDT knowledge; ~300 LOC core; fully fuzz-testable; no black box    | No free sub-transaction text merging; we own the tombstone/compaction edge cases |
-| Per-property LWW registers                     | Concurrent edits to different properties never conflict                    | Same-property concurrent edits lose one value (accepted for canvas props)        |
-| LWW over OT/transform functions                | Order-independent merge is trivially correct and testable                  | "Latest wins" can silently discard intent for the _same_ property                |
-| HLC over pure Lamport                          | Close to wall time → intuitive conflicts; bounded drift                    | Slightly more logic (wall clamping)                                              |
-| Undo = new inverse ops                         | Reuses the merge path; works offline and across users                      | Undo is itself an edit (LWW, not isolation-preserving)                           |
-| JSON wire format first                         | Debuggable, types shared directly                                          | ~1.5× bytes vs MessagePack; revisit after load tests                             |
-| Op log + snapshots in Postgres                 | One transactional store; version restore falls out naturally               | Log growth requires disciplined compaction                                       |
-| Redis pub/sub (not Streams)                    | Ops are replayable from Postgres — Redis is transport, not source of truth | No Redis-side durability needed (and none claimed)                               |
-| Gateway as the single ordering point (stage 2) | One place decides the order → every replica folds the same history         | A round trip on every edit; concurrent writes lose intent silently               |
-| No optimistic apply (stage 2)                  | The scene is always a prefix of the server's history — no divergence       | Every keystroke waits for the round trip; feels laggy on a bad link              |
-| Broadcast to the author as well                | The author applies its own ops in the same order as everybody else         | The author cannot render before the server answers                               |
+| Decision                                       | Why                                                                            | Cost                                                                             |
+| ---------------------------------------------- | ------------------------------------------------------------------------------ | -------------------------------------------------------------------------------- |
+| Hand-rolled LWW-map + RGA + HLC instead of Yjs | Proves CRDT knowledge; ~300 LOC core; fully fuzz-testable; no black box        | No free sub-transaction text merging; we own the tombstone/compaction edge cases |
+| Per-property LWW registers                     | Concurrent edits to different properties never conflict                        | Same-property concurrent edits lose one value (accepted for canvas props)        |
+| LWW over OT/transform functions                | Order-independent merge is trivially correct and testable                      | "Latest wins" can silently discard intent for the _same_ property                |
+| HLC over pure Lamport                          | Close to wall time → intuitive conflicts; no trusted clock needed              | Absorbs a peer's future wall clock on receipt (no clamping — §4.1)               |
+| Undo = new inverse ops                         | Reuses the merge path; works offline and across users                          | Undo is itself an edit (LWW, not isolation-preserving)                           |
+| JSON wire format first                         | Debuggable, types shared directly                                              | ~1.5× bytes vs MessagePack; revisit after load tests                             |
+| Op log + snapshots in Postgres                 | One transactional store; version restore falls out naturally                   | Log growth requires disciplined compaction                                       |
+| Redis pub/sub (not Streams)                    | Ops are replayable from Postgres — Redis is transport, not source of truth     | No Redis-side durability needed (and none claimed)                               |
+| Delete-wins existence rule                     | No late `setProp` can resurrect a deleted object; ties are deterministic       | A create tied exactly with a delete loses; undo must be strictly later           |
+| Operation id as the final tie-break            | Even identical HLCs resolve the same way on every replica                      | Version compare is a 4-tuple, not just an HLC compare                            |
+| Explicit top/bottom origins for z-order        | Creation appends, "send to back" prepends — both have a meaning                | One extra field in every order entry                                             |
+| Gateway merges but no longer orders            | Server and clients run the same code path, so they cannot disagree             | The gateway must hold a replica of every room it serves                          |
+| No optimistic apply (stage 3)                  | The scene is always a prefix of the replicated document — easy to reason about | Every keystroke waits for the round trip; feels laggy on a bad link (stage 5)    |
+| Broadcast to the author as well                | The author merges the same envelopes as everybody else                         | The author cannot render before the server answers                               |
 
 ---
 
@@ -434,7 +501,7 @@ syncanvas/
 │   ├── src/
 │   │   ├── index.ts         # HTTP + health + WebSocket upgrade (stage 2) ✅
 │   │   ├── gateway.ts       # Protocol handling, broadcast, server ids (stage 2) ✅
-│   │   ├── rooms.ts         # Room registry, naive LWW merge (stage 2) ✅
+│   │   ├── rooms.ts         # Room registry, CRDT merge (stage 3) ✅
 │   │   └── config.ts
 │   └── tsconfig.json
 ├── shared/                  # Single source of truth for types + CRDT
@@ -447,7 +514,7 @@ syncanvas/
 │   │   ├── scene.ts         # Scene state + applyOp (stage 1) ✅
 │   │   ├── hlc.ts           # Hybrid logical clock (stage 2) ✅
 │   │   ├── initialScene.ts  # Room seed scene (stage 2) ✅
-│   │   └── crdt/            # LWW-map, RGA, merge (stage 3)
+│   │   └── crdt/            # LWW-map, RGA, merge + fuzz tests (stage 3) ✅
 │   └── tsconfig.json
 ├── scripts/
 │   ├── browser.mjs          # Chromium resolution shared by the smoke tests
@@ -516,22 +583,26 @@ operations are applied — the only state they can undo. One user gesture is
 one undo entry, even when it produced several operations (a drag writes
 `x` and `y`). Redo replays the original operations.
 
-This is a local, single-user undo. Stage 5 replaces it with the per-user,
-cross-user semantics described in §4.5.
+This is a local undo stack. Stage 3 keeps the inverse-operation mechanism but
+runs the inverse through the CRDT merge, so undo is just another edit and
+travels to every replica (§4.6).
 
 ### 12.4 What is _not_ in stage 1
 
 - `editText` is accepted but ignored: text is edited as a whole string
-  through `setProp('text', …)` until the per-character RGA lands in stage 3.
+  through `setProp('text', …)` until the per-character RGA lands in stage 5.
 - No WebSocket, no presence, no persistence — stage 2 onwards.
-- Concurrent creates are order sensitive (§4.3).
+- Concurrent creates were order sensitive; stage 3 replaced the order array
+  with an RGA (§4.3).
 
 ---
 
-## 13. Stage 2 — the gateway and the naive LWW sync
+## 13. Stage 2 (historical) — the gateway and the naive LWW sync
 
-Stage 2 adds the one thing stage 1 could not have: a **second person**. The
-architecture has three pieces.
+Stage 2 adds the one thing stage 1 could not have: a **second person**. This
+section records the design that shipped; §14 describes the merge that replaced
+it in stage 3. The transport described here — identities, outbox, sequence
+numbers, reconnect — is still what the running gateway does.
 
 ```
 ┌────────────────┐  ops   ┌──────────────────┐  ops   ┌────────────────┐
@@ -542,10 +613,10 @@ architecture has three pieces.
                           └──────────────────┘
 ```
 
-### 14.1 The gateway (`server/src/gateway.ts`, `server/src/rooms.ts`)
+### 13.1 The gateway (`server/src/gateway.ts`, `server/src/rooms.ts`)
 
-The gateway is deliberately small and has exactly one responsibility: **decide
-the order in which operations happen.**
+The gateway was deliberately small and had exactly one responsibility: **decide
+in what order operations are broadcast.**
 
 - A socket connects, sends `auth`, and receives a `welcome` with a
   **server-assigned** `userId` and a colour. A client cannot choose its
@@ -553,59 +624,51 @@ the order in which operations happen.**
   identity of the socket that sent it — nobody can forge another peer.
 - `join` adds the client to a room and sends it the room state
   (`snapshotSeq` + the objects) plus the roster.
-- An `ops` batch is merged into the room: the operations are applied in the
-  order they arrived, the room's sequence number advances by one, and the
-  batch is broadcast to **everyone in the room, the author included**.
+- An `ops` batch is deduped, merged into the room's document (arrival order in
+  stage 2, CRDT in stage 3), assigned the next sequence number, and broadcast
+  to **everyone in the room, the author included**.
 - `op.id` is the idempotency key. A batch that contains an operation the room
   has already seen is not applied twice; the author is sent the full state
   instead, because a duplicate means it missed a broadcast.
-- The rooms live in memory for now. `seenOpIds` is the replay guard that
-  moves into Postgres as `UNIQUE (room_id, op_key)` in stage 4.
+- The rooms live in memory for now. The document's `seen` set is the replay
+  guard that moves into Postgres as `UNIQUE (room_id, op_key)` in stage 4.
 
-### 14.2 The client (`client/src/net/syncClient.ts`)
+### 13.2 The client (`client/src/net/syncClient.ts`)
 
 - The client keeps an **outbox** of envelopes it has sent but the gateway has
   not acknowledged. An acknowledged envelope is dropped.
-- It applies operations **strictly in sequence order**. A batch that arrives
+- It delivers operations **strictly in sequence order**. A batch that arrives
   early is buffered until its predecessor shows up; a gap means something was
-  lost, and the client asks for the full state instead of guessing.
+  lost, and the client asks for the full state instead of guessing. This
+  ordering is now a transport guarantee, not the merge rule: the store would
+  converge even if the batches arrived out of order.
 - **No optimistic apply.** The client does not apply its own operations when
   it creates them — it waits for the gateway to echo them back. The price is a
   round trip on every edit; the benefit is that the scene is always a prefix
-  of the server's history, so two replicas cannot drift apart.
+  of the replicated document. Local-first apply is stage 5.
 - On reconnect the client sends `sync {snapshotSeq, opIds}`; the gateway
   acknowledges the operations it already has and sends the current state, and
   the client re-sends only what is missing.
-- The hybrid logical clock (`shared/src/hlc.ts`) stamps every envelope, so
-  the operation log keeps a causal order even before the CRDT needs one.
+- The hybrid logical clock (`shared/src/hlc.ts`) stamps every envelope.
 
-### 14.3 What "naive LWW" costs
+### 13.3 What naive LWW cost (and what stage 3 fixed)
 
-The merge is `applyOps` in arrival order — the last write to a property wins.
-That is convergent (every replica ends with the same scene) but it is **not
-conflict-free**:
+The stage-2 merge was `applyOps` in arrival order — the last write to a
+property won. That was convergent (every replica ended with the same scene) but
+not conflict-free:
 
-| Situation                                     | Stage 2 behaviour                                        |
-| --------------------------------------------- | -------------------------------------------------------- |
-| Two users drag the same rect at the same time | One drag is lost; the winner depends on arrival order    |
-| Two users set different properties            | No conflict — the properties are independent             |
-| Two users create an object at the same time   | Both survive, but their z-order depends on arrival order |
-| A client is offline for a minute              | Its edits are lost: they never reach the gateway         |
+| Situation                                     | Stage 2 behaviour                                        | Stage 3                              |
+| --------------------------------------------- | -------------------------------------------------------- | ------------------------------------ |
+| Two users drag the same rect at the same time | One drag is lost; the winner depends on arrival order    | Later version wins on every replica  |
+| Two users set different properties            | No conflict — the properties are independent             | Unchanged                            |
+| Two users create an object at the same time   | Both survive, but their z-order depends on arrival order | RGA orders them deterministically    |
+| A client is offline for a minute              | Its edits are lost: they never reach the gateway         | Still lost — stage 5 adds the outbox |
 
-The first and the last row are the reason stage 3 exists. A CRDT merge
-decides the winner by a deterministic total order (the HLC), not by who the
-server happened to hear first, and it merges histories that never met.
-
-While the connection is down the editor keeps behaving like stage 1: the
-operations are applied locally and never queued, so they are lost when the
-client reconnects and re-syncs to the room. A durable offline outbox is
-stage 5.
-
-### 14.4 How it is tested
+### 13.4 How stage 2 is tested
 
 | Test                                         | What it proves                                                                                                                                 |
 | -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| `server/src/rooms.test.ts`                   | The merge semantics: arrival order wins, duplicates are dropped, the sequence advances once per batch                                          |
+| `server/src/rooms.test.ts`                   | Room lifecycle, dedupe and one sequence per batch (the CRDT merge assertions were added in stage 3)                                            |
 | `server/src/gateway.test.ts`                 | Two real WebSocket clients: join, broadcast, ack, identity stamping, room isolation                                                            |
 | `client/src/net/syncClient.test.ts`          | The client against an injected socket: ordering, the outbox, reconnect and re-sync                                                             |
 | `client/src/store/sceneStore.test.ts`        | The store in connected mode: it sends instead of applying, and the undo stack follows the gateway                                              |
@@ -623,14 +686,85 @@ The stage 2 checklist:
 
 ---
 
-## 14. Roadmap
+## 14. Stage 3 — the CRDT merge
 
-| Stage    | Milestone                                                             | Exit criterion                         |
-| -------- | --------------------------------------------------------------------- | -------------------------------------- |
-| 0        | Monorepo, compose, CI, design doc, shared types                       | CI green; compose healthy              |
-| 1        | Canvas, transform maths, operation pipeline, undo/redo                | 500 objects at 60 fps; ops only        |
-| 2 (this) | WS gateway, naive LWW sync                                            | Two browsers move a rect live          |
-| 3        | Full CRDT (RGA, tombstones), presence/cursors, convergence fuzz tests | 10 000 randomized schedules converge   |
-| 4        | Redis pub/sub sharding, Postgres op log + snapshots, JWT rooms        | 2 gateways in sync; restart-safe       |
-| 5        | Offline outbox, per-user undo/redo, version restore, k6 load tests    | p95 < 80 ms @ 200 users; 0 lost writes |
-| 6        | Dockerfiles, AWS deploy, GitHub Actions CD, README + demo GIF         | Live URL + demo video                  |
+Stage 3 replaces the arbiter with a merge. The gateway is still the relay:
+it assigns sequence numbers, owns the room document and fans envelopes out.
+But it no longer _decides_ the winner; it merges. Every browser runs the same
+pure `mergeEnvelope` from `shared/src/crdt/`, so the browser and the server
+cannot disagree about the merge rule.
+
+```
+┌────────────────┐  ops   ┌──────────────────────────┐  ops   ┌────────────────┐
+│ Client A       │ ─────► │ Gateway (ws)             │ ─────► │ Client B       │
+│ doc.merge()    │ ◄───── │ room.doc.merge()         │ ◄───── │ doc.merge()    │
+│ project → SVG  │  echo  │ seq per batch (watermark)│  echo  │ project → SVG  │
+└────────────────┘        └──────────────────────────┘        └────────────────┘
+```
+
+**What changed**
+
+- `server/src/rooms.ts` holds a `SceneDoc` and calls `mergeEnvelopes` with the
+  accepted batch. `snapshot()` projects it with `toSceneState` +
+  `serializeScene`. The `seen` set inside the document is the dedupe guard.
+- `client/src/store/sceneStore.ts` holds a `SceneDoc`. In local mode it stamps
+  operations with a local HLC and merges them; in live mode the echo from the
+  gateway carries the same envelopes and is merged the same way. The scene is
+  always `toSceneState(doc)`, so the rendering path did not change.
+- `client/src/net/syncClient.ts` hands the **envelopes** (not just the bare
+  operations) to the store, because the merge needs the HLC and the op id.
+- Undo and redo emit inverse operations stamped with a fresh HLC, so they are
+  ordinary edits and converge through the same path (§4.6).
+
+**What is still missing**
+
+- **Optimistic local apply.** In live mode the author still waits for the echo.
+  The merge would allow applying immediately and reconciling, but the undo
+  stack and the outbox need to agree on what "already applied" means first.
+- **Full-state sync.** A joining client receives the projected scene, not the
+  tombstones and register versions. That is sufficient for the operations it
+  receives afterwards, but a full CRDT snapshot belongs with the persisted log
+  in stage 4.
+- **Tombstone compaction.** Deleted objects are kept forever; safe, but the
+  document grows. Compaction needs a watermark past all in-flight replicas.
+- **Per-character text.** §4.4.
+
+### 14.1 How stage 3 is tested
+
+| Test                                  | What it proves                                                                                                                                    |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `shared/src/crdt/register.test.ts`    | Version order, op-id tie-break, idempotence                                                                                                       |
+| `shared/src/crdt/rga.test.ts`         | Top/bottom/after origins, moves, dead hinges, cycle breaking, deterministic sibling order                                                         |
+| `shared/src/crdt/doc.test.ts`         | Out-of-order writes and deletes, delete-wins, resurrection, projection, seed parity, idempotent replay                                            |
+| `shared/src/crdt/convergence.test.ts` | 10,000 randomized schedules (2–5 clients, shuffled + duplicated delivery) end in the same `docFingerprint` and the same projected scene           |
+| `shared/src/crdt/convergence.test.ts` | Oracle: every register holds the maximum-version write, computed independently of the merge                                                       |
+| `shared/src/crdt/convergence.test.ts` | Clock skew: a client 10 minutes ahead wins its first edit, then loses to clients that observed it; delivery order does not change the final state |
+| `server/src/rooms.test.ts`            | The gateway keeps the newest write even when it arrives first, and a late edit cannot resurrect a deleted object                                  |
+| `scripts/sync-smoke.mjs`              | Two real browsers still converge, undo still travels, and both survive a gateway restart                                                          |
+
+The stage 3 checklist:
+
+- [x] Hybrid logical clock with a total order and skew absorption
+- [x] LWW register per object property, keyed by `(value, HLC, opId)`
+- [x] Deterministic tie-break, including exact-clock ties
+- [x] Delete-wins tombstones, with resurrection by a strictly later create
+- [x] RGA for z-order with top/bottom origins, dead hinges and cycle breaking
+- [x] Idempotent, commutative, associative `mergeEnvelope`
+- [x] Pure, dependency-free module in `shared/src/crdt/`
+- [x] 10,000 randomized schedules converge, with an independent oracle
+- [x] A 10-minute clock skew converges and does not win forever
+- [x] Gateway and editor both merge through the CRDT
+
+---
+
+## 15. Roadmap
+
+| Stage    | Milestone                                                           | Exit criterion                         |
+| -------- | ------------------------------------------------------------------- | -------------------------------------- |
+| 0        | Monorepo, compose, CI, design doc, shared types                     | CI green; compose healthy              |
+| 1        | Canvas, transform maths, operation pipeline, undo/redo              | 500 objects at 60 fps; ops only        |
+| 2        | WS gateway, naive LWW sync                                          | Two browsers move a rect live          |
+| 3 (done) | HLC, LWW-map, RGA z-order, tombstones, convergence fuzz tests       | 10 000 randomized schedules converge   |
+| 4        | Redis pub/sub sharding, Postgres op log + CRDT snapshots, JWT rooms | 2 gateways in sync; restart-safe       |
+| 5        | Offline outbox, optimistic apply, text RGA, version restore, k6     | p95 < 80 ms @ 200 users; 0 lost writes |
+| 6        | Dockerfiles, AWS deploy, GitHub Actions CD, README + demo GIF       | Live URL + demo video                  |

@@ -2,8 +2,8 @@ import { describe, expect, it } from 'vitest';
 import type { Op, OpEnvelope } from '@syncanvas/shared';
 import { RoomRegistry, type RoomMember } from './rooms.js';
 
-function envelope(id: string, op: Op, actorId = 'user_1'): OpEnvelope {
-  return { id, actorId, hlc: { wall: 1, counter: 0, actorId }, op };
+function envelope(id: string, op: Op, actorId = 'user_1', wall = 1): OpEnvelope {
+  return { id, actorId, hlc: { wall, counter: 0, actorId }, op };
 }
 
 function member(clientId: string): RoomMember {
@@ -37,18 +37,6 @@ describe('the room registry', () => {
     expect(snapshot.objects.find((object) => object.id === 'demo-rect')?.x).toBe(500);
   });
 
-  it('applies operations in arrival order — naive last writer wins', () => {
-    const registry = new RoomRegistry();
-    registry.applyOps('demo', [
-      envelope('op_1', { kind: 'setProp', objectId: 'demo-rect', prop: 'x', value: 100 }),
-    ]);
-    registry.applyOps('demo', [
-      envelope('op_2', { kind: 'setProp', objectId: 'demo-rect', prop: 'x', value: 200 }),
-    ]);
-    const snapshot = registry.snapshot('demo');
-    expect(snapshot.objects.find((object) => object.id === 'demo-rect')?.x).toBe(200);
-  });
-
   it('applies the last write of a batch, not the first', () => {
     const registry = new RoomRegistry();
     registry.applyOps('demo', [
@@ -57,6 +45,45 @@ describe('the room registry', () => {
     ]);
     const snapshot = registry.snapshot('demo');
     expect(snapshot.objects.find((object) => object.id === 'demo-rect')?.x).toBe(300);
+  });
+
+  it('keeps the newest write by clock even when it arrives first', () => {
+    const registry = new RoomRegistry();
+    registry.applyOps('demo', [
+      envelope(
+        'newer',
+        { kind: 'setProp', objectId: 'demo-rect', prop: 'x', value: 200 },
+        'user_1',
+        20,
+      ),
+    ]);
+    registry.applyOps('demo', [
+      envelope(
+        'older',
+        { kind: 'setProp', objectId: 'demo-rect', prop: 'x', value: 100 },
+        'user_2',
+        10,
+      ),
+    ]);
+    const snapshot = registry.snapshot('demo');
+    expect(snapshot.objects.find((object) => object.id === 'demo-rect')?.x).toBe(200);
+  });
+
+  it('tombstones a deleted object so a late edit cannot resurrect it', () => {
+    const registry = new RoomRegistry();
+    registry.applyOps('demo', [
+      envelope('delete', { kind: 'deleteObject', objectId: 'demo-rect' }, 'user_1', 10),
+    ]);
+    registry.applyOps('demo', [
+      envelope(
+        'late',
+        { kind: 'setProp', objectId: 'demo-rect', prop: 'x', value: 999 },
+        'user_2',
+        20,
+      ),
+    ]);
+    const snapshot = registry.snapshot('demo');
+    expect(snapshot.objects.map((object) => object.id)).not.toContain('demo-rect');
   });
 
   it('ignores an operation it has already seen', () => {

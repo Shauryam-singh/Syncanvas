@@ -1,6 +1,6 @@
 import { cleanup, render } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { createSceneState, type SceneObject } from '@syncanvas/shared';
+import { createDoc, createSceneState, type SceneObject } from '@syncanvas/shared';
 import { SceneCanvas } from './SceneCanvas';
 import { useSceneStore } from '../store/sceneStore';
 
@@ -29,6 +29,7 @@ function pointer(type: string, clientX: number, clientY: number): MouseEvent {
 
 beforeEach(() => {
   useSceneStore.setState({
+    doc: createDoc([rect]),
     scene: createSceneState([rect]),
     selection: [],
     tool: 'select',
