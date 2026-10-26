@@ -88,6 +88,38 @@ describe('the HTTP API', () => {
     expect(claims?.name).toBe('Ada');
   });
 
+  it('lets a guest rename themselves and reissues the token', async () => {
+    const session = await guest('Ada');
+
+    const response = await post(
+      '/api/auth/profile',
+      { displayName: '  Ada   Lovelace  ' },
+      session.token,
+    );
+    expect(response.status).toBe(200);
+    const updated = (await response.json()) as SessionResponse;
+    expect(updated.user.id).toBe(session.user.id);
+    expect(updated.user.displayName).toBe('Ada Lovelace');
+    expect((await store.user(session.user.id))?.displayName).toBe('Ada Lovelace');
+
+    const claims = verifyAccessToken(updated.token, SECRET);
+    expect(claims?.sub).toBe(session.user.id);
+    expect(claims?.name).toBe('Ada Lovelace');
+  });
+
+  it('rejects an empty display name', async () => {
+    const session = await guest('Ada');
+    const response = await post('/api/auth/profile', { displayName: '   ' }, session.token);
+    expect(response.status).toBe(400);
+    expect(((await response.json()) as ApiErrorBody).error.code).toBe('invalid_request');
+  });
+
+  it('requires a bearer token to rename a guest', async () => {
+    const response = await post('/api/auth/profile', { displayName: 'Mallory' });
+    expect(response.status).toBe(401);
+    expect(((await response.json()) as ApiErrorBody).error.code).toBe('unauthorized');
+  });
+
   it('rejects malformed guest requests', async () => {
     const response = await fetch(`${base}/api/auth/guest`, {
       method: 'POST',

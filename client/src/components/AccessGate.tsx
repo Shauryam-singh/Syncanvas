@@ -1,5 +1,6 @@
-import type { ReactNode } from 'react';
+import { useState, type ReactNode } from 'react';
 import { clearSession } from '../net/session';
+import { demoRoomUrl } from '../net/urls';
 import { useSceneStore } from '../store/sceneStore';
 
 /**
@@ -9,19 +10,59 @@ import { useSceneStore } from '../store/sceneStore';
  * the same missing membership) would just fail again. The gate explains why
  * and offers the two useful exits — sign in as a fresh guest, or open the
  * public demo room.
+ *
+ * Signing out is not a denial: it deliberately parks here so a guest can pick
+ * a display name before entering the public demo room. Without this stop the
+ * app would immediately mint another guest and silently rejoin the old room.
  */
 export function AccessGate({ children }: { children: ReactNode }) {
   const access = useSceneStore((state) => state.access);
   const message = useSceneStore((state) => state.accessMessage);
   const roomId = useSceneStore((state) => state.roomId);
   const roomName = useSceneStore((state) => state.roomName);
+  const [displayName, setDisplayName] = useState('');
+
+  if (access === 'signedout') {
+    return (
+      <main className="gate">
+        <div className="gate__card">
+          <span className="badge">Signed out</span>
+          <h1>You have left the room</h1>
+          <p>Choose the name other people will see. No account or password is needed.</p>
+          <form
+            className="gate__form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              window.location.assign(demoRoomUrl(window.location.href, displayName));
+            }}
+          >
+            <label className="gate__field">
+              <span>Display name</span>
+              <input
+                autoFocus
+                value={displayName}
+                maxLength={40}
+                placeholder="Leave blank for a random guest name"
+                onChange={(event) => setDisplayName(event.target.value)}
+              />
+            </label>
+            <div className="gate__actions">
+              <button type="submit" className="tool-button">
+                Enter the demo room
+              </button>
+            </div>
+          </form>
+          <p className="gate__hint muted">
+            You can change your name later from the room header while you are a guest.
+          </p>
+        </div>
+      </main>
+    );
+  }
 
   if (access !== 'denied') return <>{children}</>;
 
-  const demo = new URL(window.location.href);
-  demo.hash = '';
-  demo.search = '';
-  demo.searchParams.set('room', 'demo');
+  const demo = demoRoomUrl(window.location.href);
 
   return (
     <main className="gate">

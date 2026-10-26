@@ -38,6 +38,8 @@ export interface Store {
 
   createUser(displayName: string): Promise<User>;
   user(id: string): Promise<User | null>;
+  /** Renames a guest. Returns `null` when the user no longer exists. */
+  renameUser(id: string, displayName: string): Promise<User | null>;
 
   createDocument(input: { id: string; name: string; ownerId: string }): Promise<DocumentRecord>;
   document(id: string): Promise<DocumentRecord | null>;

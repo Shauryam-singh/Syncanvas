@@ -24,7 +24,6 @@ export function Toolbar() {
   const deleteSelected = useSceneStore((state) => state.deleteSelected);
   const reorderSelection = useSceneStore((state) => state.reorderSelection);
   const selection = useSceneStore((state) => state.selection);
-  const spawnObjects = useSceneStore((state) => state.spawnObjects);
   const canEdit = useSceneStore(selectCanEdit);
 
   const hasSelection = selection.length > 0;
@@ -112,18 +111,6 @@ export function Toolbar() {
           title="Send to back"
         >
           Back
-        </button>
-      </div>
-
-      <div className="toolbar-group toolbar-group--end">
-        <button
-          type="button"
-          className="tool-button"
-          onClick={() => spawnObjects(500)}
-          disabled={!canEdit}
-          title="Add 500 objects — performance check"
-        >
-          +500
         </button>
       </div>
     </div>

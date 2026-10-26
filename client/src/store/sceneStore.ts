@@ -37,7 +37,7 @@ export type Tool = 'select' | SceneObjectType;
  * until the gateway has told us the role, so a viewer cannot race the server
  * by drawing during the handshake.
  */
-export type AccessState = 'local' | 'checking' | 'granted' | 'denied';
+export type AccessState = 'local' | 'checking' | 'granted' | 'denied' | 'signedout';
 
 export interface SessionIdentity {
   userId: string;
@@ -162,7 +162,6 @@ export interface SceneStore {
   updateObject: (id: string, changes: EditableProps) => void;
   deleteSelected: () => void;
   reorderSelection: (action: 'front' | 'forward' | 'backward' | 'back') => void;
-  spawnObjects: (count: number) => void;
   loadScene: (objects: SceneObject[]) => void;
 
   beginMove: (objectIds: string[], pointer: Point) => void;
@@ -454,29 +453,6 @@ export const useSceneStore = create<SceneStore>((set, get) => ({
     }
 
     if (ops.length === 0) return;
-    get().dispatch(ops);
-  },
-
-  spawnObjects: (count) => {
-    const ops: Op[] = [];
-    for (let i = 0; i < count; i += 1) {
-      const type: SceneObjectType = i % 3 === 0 ? 'rect' : i % 3 === 1 ? 'ellipse' : 'text';
-      const size = DEFAULT_SIZE[type];
-      ops.push({
-        kind: 'createObject',
-        object: createSceneObject({
-          id: newId('obj'),
-          type,
-          x: Math.round(Math.random() * 1600 - 200),
-          y: Math.round(Math.random() * 1000 - 150),
-          w: size.w,
-          h: size.h,
-          rotation: Math.round(Math.random() * 60) - 30,
-          fill: DEFAULT_FILL[type],
-          text: type === 'text' ? `Object ${i + 1}` : undefined,
-        }),
-      });
-    }
     get().dispatch(ops);
   },
 

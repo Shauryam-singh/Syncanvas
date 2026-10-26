@@ -216,7 +216,7 @@ describe('the gateway', () => {
     expect(joined.name).toBe('Demo canvas');
 
     const state = await client.waitFor('state');
-    expect(state.objects.length).toBe(4);
+    expect(state.objects.length).toBe(3);
     expect(state.objects.some((object) => object.id === 'demo-rect')).toBe(true);
   });
 

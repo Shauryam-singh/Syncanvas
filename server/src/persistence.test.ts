@@ -1,5 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import { deserializeDoc, toSceneState, type Op, type OpEnvelope } from '@syncanvas/shared';
+import {
+  createDoc,
+  createInitialScene,
+  createSceneObject,
+  deserializeDoc,
+  serializeDoc,
+  toSceneState,
+  type Op,
+  type OpEnvelope,
+} from '@syncanvas/shared';
 import { loadRooms, RoomPersistence } from './persistence.js';
 import { RoomRegistry } from './rooms.js';
 import { MemoryStore } from './store/memory.js';
@@ -33,6 +42,34 @@ describe('room persistence', () => {
       .objects.find((object) => object.id === 'demo-rect');
     expect(rect?.x).toBe(456);
     expect(registry.room('room_restart')?.seq).toBe(1);
+  });
+
+  it('prunes an untouched retired seed object from an old snapshot', async () => {
+    const store = new MemoryStore();
+    const user = await store.createUser('Ada');
+    const document = await store.createDocument({
+      id: 'room_legacy',
+      name: 'Legacy',
+      ownerId: user.id,
+    });
+    const legacyText = createSceneObject({
+      id: 'demo-text',
+      type: 'text',
+      x: 100,
+      y: 260,
+      w: 320,
+      h: 44,
+      fill: '#0f172a',
+      text: 'Drag, resize, rotate — every edit is an operation',
+    });
+    const oldDoc = createDoc([...createInitialScene(), legacyText]);
+    await store.saveSnapshot(document.id, 0, serializeDoc(oldDoc));
+
+    const registry = new RoomRegistry();
+    await loadRooms(store, registry);
+    const ids = registry.snapshot('room_legacy').objects.map((object) => object.id);
+    expect(ids).not.toContain('demo-text');
+    expect(ids).toContain('demo-rect');
   });
 
   it('writes accepted operations and flushes a snapshot', async () => {

@@ -478,6 +478,9 @@ durable history work in Stage 5.
   higher `seq`. If the snapshot is missing or unreadable, the gateway falls back
   to the seed scene plus the full log. The merge is order-independent, so replay
   order is irrelevant.
+- A load also prunes untouched records for **retired seed objects** (the old
+  `demo-text` prompt). The record must still carry only `seed:*` stamps; an
+  object somebody moved or edited is user data and is kept.
 - Snapshots are **internal checkpoints**, not user-visible versions.
 
 **Not implemented yet:**
@@ -887,10 +890,17 @@ and close code `4001`; the client treats that as terminal and shows the access
 gate rather than reconnecting in a loop. The same secret signs invite tokens,
 but their `typ` claim (`access` vs `invite`) keeps them from being confused.
 
+`POST /api/auth/profile` renames the signed-in guest and returns a fresh
+`SessionResponse`; the server updates the user row and signs a new access token
+with the same `sub` and a new `name`. The client persists that session and
+reloads once, which reconnects the socket so peers see the new presence name.
+
 The browser caches `{token, user, expiresAt, server}` in `localStorage`. The
 token is held outside Zustand and only attached on demand. The cache is scoped
 to the gateway that issued it (tokens do not travel), and an expired cache is
-replaced by a fresh guest. There is deliberately no password flow; see the
+replaced by a fresh guest. Signing out clears the cache and navigates to a
+deliberate name gate (`?signedout=1`) instead of immediately minting another
+guest and re-entering the room. There is deliberately no password flow; see the
 tradeoff table.
 
 ### 15.2 Rooms, membership and invites

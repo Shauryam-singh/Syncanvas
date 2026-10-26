@@ -126,6 +126,37 @@ kbd {
   white-space: nowrap;
 }
 
+.room-panel__user--button {
+  border: 0;
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.room-panel__user--button:hover:not(:disabled) {
+  background: #e2e8f0;
+}
+
+.room-panel__user--button:disabled {
+  cursor: default;
+}
+
+.room-panel__name {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.room-panel__name input {
+  width: 140px;
+  padding: 4px 7px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #f8fafc;
+  font-family: inherit;
+  font-size: 12px;
+}
+
 .room-panel__readonly {
   padding: 2px 8px;
   border-radius: 999px;
@@ -245,6 +276,33 @@ kbd {
   line-height: 1.55;
 }
 
+.gate__form {
+  margin-top: 18px;
+}
+
+.gate__field {
+  display: grid;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.gate__field input {
+  width: 100%;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #f8fafc;
+  color: var(--text);
+  font: inherit;
+  font-size: 14px;
+}
+
+.gate__field input:focus {
+  outline: 2px solid var(--accent-soft);
+  border-color: var(--accent);
+}
+
 .gate__actions {
   display: flex;
   align-items: center;
@@ -280,10 +338,6 @@ kbd {
 .toolbar-group {
   display: flex;
   gap: 4px;
-}
-
-.toolbar-group--end {
-  margin-left: auto;
 }
 
 .tool-button {

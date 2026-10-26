@@ -3,6 +3,7 @@ import {
   createInitialScene,
   deserializeDoc,
   mergeEnvelopes,
+  pruneRetiredSeeds,
   serializeDoc,
   type OpEnvelope,
   type SceneDoc,
@@ -33,6 +34,9 @@ export async function loadRooms(store: Store, registry: RoomRegistry): Promise<v
     }
     const operations = await store.loadOperations(document.id, replayFrom);
     if (operations.length > 0) doc = mergeEnvelopes(doc, operations);
+    // A snapshot from an older release may still contain a retired seed
+    // object. Drop it only while it is untouched; edited objects are user data.
+    doc = pruneRetiredSeeds(doc);
     const seq = Math.max(await store.latestSeq(document.id), snapshot?.seq ?? 0);
     registry.installRoom({ id: document.id, doc, seq });
   }

@@ -67,6 +67,12 @@ suite('PostgresStore', () => {
       id: owner.id,
       displayName: 'Owner',
     });
+    expect(await store.renameUser(owner.id, 'Owner Renamed')).toMatchObject({
+      id: owner.id,
+      displayName: 'Owner Renamed',
+    });
+    expect(await store.user(owner.id)).toMatchObject({ displayName: 'Owner Renamed' });
+    expect(await store.renameUser('user_missing', 'Nobody')).toBeNull();
     expect((await store.allDocuments()).map((doc) => doc.id)).toEqual(['room_pg']);
   });
 
@@ -107,7 +113,7 @@ suite('PostgresStore', () => {
     await store.saveSnapshot(document.id, 2, serializeDoc(snapshotDoc));
     const snapshot = await store.latestSnapshot(document.id);
     expect(snapshot?.seq).toBe(2);
-    expect(deserializeDoc(snapshot?.doc).objects.size).toBe(4);
+    expect(deserializeDoc(snapshot?.doc).objects.size).toBe(3);
   });
 
   it('rebuilds a room from the snapshot plus later operations', async () => {

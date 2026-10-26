@@ -1,5 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ApiError, createInvite, createRoom, httpBaseFor, listRooms, signInGuest } from './api';
+import {
+  ApiError,
+  createInvite,
+  createRoom,
+  httpBaseFor,
+  listRooms,
+  signInGuest,
+  updateDisplayName,
+} from './api';
 
 function reply(body: unknown, status = 200): Response {
   return {
@@ -45,6 +53,26 @@ describe('the HTTP API client', () => {
     expect(init.method).toBe('POST');
     expect(init.headers).toEqual({ 'content-type': 'application/json' });
     expect(init.body).toBe(JSON.stringify({ displayName: 'Ada' }));
+  });
+
+  it('renames a guest and returns the new session', async () => {
+    fetchMock.mockResolvedValue(
+      reply({
+        token: 'tok2',
+        user: { id: 'u1', displayName: 'Ada Lovelace' },
+        expiresAt: 456,
+      }),
+    );
+
+    const updated = await updateDisplayName('http://localhost:8080', 'tok', 'Ada Lovelace');
+    expect(updated.user.displayName).toBe('Ada Lovelace');
+    expect(updated.token).toBe('tok2');
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('http://localhost:8080/api/auth/profile');
+    expect(init.method).toBe('POST');
+    expect((init.headers as Record<string, string>).authorization).toBe('Bearer tok');
+    expect(init.body).toBe(JSON.stringify({ displayName: 'Ada Lovelace' }));
   });
 
   it('sends the bearer token and the requested role when minting an invite', async () => {

@@ -25,7 +25,7 @@ describe('the room registry', () => {
   it('seeds a new room with the demo scene', () => {
     const registry = new RoomRegistry();
     const snapshot = registry.snapshot('demo');
-    expect(snapshot.objects.length).toBe(4);
+    expect(snapshot.objects.length).toBe(3);
     expect(snapshot.objects.map((object) => object.id)).toContain('demo-rect');
     expect(snapshot.snapshotSeq).toBe(0);
   });
@@ -191,7 +191,7 @@ describe('the room registry', () => {
       }),
     ]);
     const snapshot = registry.snapshot('demo');
-    expect(snapshot.objects).toHaveLength(5);
+    expect(snapshot.objects).toHaveLength(4);
     expect(snapshot.objects[snapshot.objects.length - 1]?.id).toBe('obj_new');
   });
 });

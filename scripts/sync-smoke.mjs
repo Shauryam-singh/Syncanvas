@@ -333,11 +333,6 @@ check(
   await viewer.getByRole('button', { name: 'Rect' }).isDisabled(),
   true,
 );
-check(
-  'viewer cannot mix the performance batch',
-  await viewer.getByRole('button', { name: '+500' }).isDisabled(),
-  true,
-);
 checkTrue(
   'viewer is told the room is read-only',
   (await viewer.locator('.room-panel__readonly').innerText()) === 'Read-only',
@@ -428,10 +423,10 @@ const countOf = (page, count) =>
     count,
     { timeout: 5_000 },
   );
-await countOf(alice, 5);
-await countOf(bob, 5);
-check('alice sees bob’s new object', await alice.locator('[data-object-id]').count(), 5);
-check('bob sees his new object', await bob.locator('[data-object-id]').count(), 5);
+await countOf(alice, 4);
+await countOf(bob, 4);
+check('alice sees bob’s new object', await alice.locator('[data-object-id]').count(), 4);
+check('bob sees his new object', await bob.locator('[data-object-id]').count(), 4);
 
 // Undo is an ordinary operation and travels to the other replica.
 await alice.getByRole('button', { name: 'Undo' }).click();
@@ -474,8 +469,8 @@ if (storeKind === 'postgres') {
   await alice.waitForTimeout(300);
 
   const aliceRole = await roleOf(alice);
-  await countOf(bob, 5);
-  check('the persisted scene comes back', await bob.locator('[data-object-id]').count(), 5);
+  await countOf(bob, 4);
+  check('the persisted scene comes back', await bob.locator('[data-object-id]').count(), 4);
   check('the owner keeps the room', aliceRole, 'owner');
 
   // The room still works after the restart.

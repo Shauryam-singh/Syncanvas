@@ -30,16 +30,6 @@ export function createInitialScene(): SceneObject[] {
       fill: '#22c55e',
     }),
     createSceneObject({
-      id: 'demo-text',
-      type: 'text',
-      x: 100,
-      y: 260,
-      w: 320,
-      h: 44,
-      fill: '#0f172a',
-      text: 'Drag, resize, rotate — every edit is an operation',
-    }),
-    createSceneObject({
       id: 'demo-line',
       type: 'line',
       x: 120,

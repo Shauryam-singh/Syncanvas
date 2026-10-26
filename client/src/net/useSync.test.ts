@@ -97,6 +97,7 @@ describe('readSyncConfig', () => {
     expect(parsed.displayName).toMatch(/^Guest /);
     expect(parsed.invite).toBeUndefined();
     expect(parsed.explicitName).toBe(false);
+    expect(parsed.signedOut).toBe(false);
   });
 
   it('reads the room, the gateway, the invite and the name from the query string', () => {
@@ -108,6 +109,11 @@ describe('readSyncConfig', () => {
     expect(parsed.displayName).toBe('Ada');
     expect(parsed.invite).toBe('signed');
     expect(parsed.explicitName).toBe(true);
+  });
+
+  it('recognises the signed-out gate', () => {
+    expect(readSyncConfig('?signedout=1').signedOut).toBe(true);
+    expect(readSyncConfig('?signedout=0').signedOut).toBe(false);
   });
 
   it('generates a different guest name every time', () => {
@@ -202,6 +208,17 @@ describe('useSync', () => {
     act(() => unmount());
     expect(useSceneStore.getState().opSender).toBeNull();
     expect(useSceneStore.getState().presenceSender).toBeNull();
+  });
+
+  it('stays at the signed-out gate instead of minting another guest', async () => {
+    const { unmount } = renderHook(() => useSync(config({ signedOut: true })));
+
+    await waitFor(() => expect(useSceneStore.getState().access).toBe('signedout'));
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(FakeSocket.instances).toHaveLength(0);
+    expect(useSceneStore.getState().session).toBeNull();
+
+    act(() => unmount());
   });
 
   it('falls back to the local editor when the HTTP API is unreachable', async () => {

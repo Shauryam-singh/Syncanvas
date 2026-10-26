@@ -159,6 +159,26 @@ export function createApiHandler(
     sendJson(res, 200, response, origin);
   }
 
+  async function updateProfile(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const user = await requireUser(req);
+    const body = await readJson(req);
+    const requested = typeof body.displayName === 'string' ? body.displayName.trim() : '';
+    const displayName = requested.replace(/\s+/g, ' ').slice(0, 40);
+    if (!displayName) {
+      throw new HttpError(400, 'invalid_request', 'Enter a display name.');
+    }
+
+    const updated = await store.renameUser(user.id, displayName);
+    if (!updated) throw new HttpError(401, 'unauthorized', 'That account no longer exists.');
+    const session = signAccessToken(updated, config.jwtSecret, config.jwtTtlSeconds);
+    const response: SessionResponse = {
+      token: session.token,
+      user: { id: updated.id, displayName: updated.displayName },
+      expiresAt: session.expiresAt,
+    };
+    sendJson(res, 200, response, origin);
+  }
+
   async function createRoom(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const user = await requireUser(req);
     const body = await readJson(req);
@@ -249,6 +269,11 @@ export function createApiHandler(
 
     if (method === 'POST' && segments[1] === 'auth' && segments[2] === 'guest') {
       await guest(req, res);
+      return;
+    }
+
+    if (method === 'POST' && segments[1] === 'auth' && segments[2] === 'profile') {
+      await updateProfile(req, res);
       return;
     }
 

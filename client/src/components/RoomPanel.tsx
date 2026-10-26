@@ -1,6 +1,6 @@
 import { useState } from 'react';
-import { createInvite, createRoom } from '../net/api';
-import { clearSession, getActiveSession } from '../net/session';
+import { createInvite, createRoom, updateDisplayName } from '../net/api';
+import { clearSession, getActiveSession, saveSession, setActiveSession } from '../net/session';
 import { useSceneStore } from '../store/sceneStore';
 
 function shareUrl(roomId: string, invite?: string): string {
@@ -36,6 +36,8 @@ export function RoomPanel() {
 
   const [creating, setCreating] = useState(false);
   const [newName, setNewName] = useState('');
+  const [editingName, setEditingName] = useState(false);
+  const [nameDraft, setNameDraft] = useState('');
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
 
@@ -81,9 +83,51 @@ export function RoomPanel() {
     }
   };
 
+  const startRename = () => {
+    setNameDraft(session?.displayName ?? '');
+    setEditingName(true);
+    setNotice(null);
+  };
+
+  const saveName = async () => {
+    const current = getActiveSession();
+    if (!current) return;
+    const name = nameDraft.trim().replace(/\s+/g, ' ').slice(0, 40);
+    if (!name) {
+      setNotice('Enter a display name.');
+      return;
+    }
+
+    setBusy(true);
+    setNotice(null);
+    try {
+      const updated = await updateDisplayName(current.server, current.token, name);
+      const next = { ...updated, server: current.server };
+      setActiveSession(next);
+      saveSession(next);
+      // A reload reconnects the socket so peers see the new name. Keep an
+      // explicit `?name=` in sync so the cached session is still reused.
+      const url = new URL(window.location.href);
+      if (url.searchParams.has('name')) {
+        url.searchParams.set('name', name);
+        window.history.replaceState(null, '', url.toString());
+      }
+      window.location.reload();
+    } catch (error) {
+      setNotice(errorMessage(error));
+      setBusy(false);
+    }
+  };
+
   const signOut = () => {
     clearSession();
-    window.location.reload();
+    const url = new URL(window.location.href);
+    const ws = url.searchParams.get('ws');
+    url.hash = '';
+    url.search = '';
+    if (ws) url.searchParams.set('ws', ws);
+    url.searchParams.set('signedout', '1');
+    window.location.assign(url.toString());
   };
 
   return (
@@ -94,9 +138,44 @@ export function RoomPanel() {
         </span>
         {role ? <span className={`role-badge role-badge--${role}`}>{role}</span> : null}
         {session ? (
-          <span className="room-panel__user" title={`Signed in as ${session.userId}`}>
-            {session.displayName}
-          </span>
+          editingName ? (
+            <form
+              className="room-panel__name"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void saveName();
+              }}
+            >
+              <input
+                autoFocus
+                value={nameDraft}
+                maxLength={40}
+                onChange={(event) => setNameDraft(event.target.value)}
+                aria-label="Display name"
+              />
+              <button type="submit" className="tool-button tool-button--small" disabled={busy}>
+                Save
+              </button>
+              <button
+                type="button"
+                className="tool-button tool-button--small"
+                onClick={() => setEditingName(false)}
+                disabled={busy}
+              >
+                Cancel
+              </button>
+            </form>
+          ) : (
+            <button
+              type="button"
+              className="room-panel__user room-panel__user--button"
+              title={`Signed in as ${session.userId} — click to change your display name`}
+              onClick={startRename}
+              disabled={busy}
+            >
+              {session.displayName}
+            </button>
+          )
         ) : null}
         {access === 'checking' ? <span className="muted">joining…</span> : null}
       </div>

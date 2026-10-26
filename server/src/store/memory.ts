@@ -46,6 +46,17 @@ export class MemoryStore implements Store {
     return this.users.get(id) ?? null;
   }
 
+  async renameUser(id: string, displayName: string): Promise<User | null> {
+    const existing = this.users.get(id);
+    if (!existing) return null;
+    const user = {
+      ...existing,
+      displayName: displayName.trim().slice(0, 40) || existing.displayName,
+    };
+    this.users.set(id, user);
+    return user;
+  }
+
   async createDocument(input: {
     id: string;
     name: string;

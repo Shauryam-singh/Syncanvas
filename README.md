@@ -35,6 +35,7 @@ a viewer cannot edit on the server even if the client UI is bypassed.
 - [x] Expired and tampered tokens refused
 - [x] A cursor disappears as soon as its socket closes
 - [x] No access to a real room without membership or a signed link
+- [x] Guests can choose or change their display name, and signing out leaves the room
 - [x] Durable rooms: the latest snapshot plus later operations survive a restart
 
 Stage 1–3 remain complete: the canvas has rect/ellipse/line/text, drag, resize,
@@ -72,7 +73,11 @@ presence model and tradeoffs.
 
 There are no passwords. `POST /api/auth/guest` mints a short-lived identity and
 an access token in one step; the browser caches it for the gateway that issued
-it. An access token is required before the WebSocket accepts `join`.
+it. An access token is required before the WebSocket accepts `join`. Guests can
+set their display name while signing in or change it later by clicking their
+name in the room header (`POST /api/auth/profile`). Signing out clears the
+session and leaves the room; it returns to a name gate instead of silently
+creating another guest in the same room.
 
 | Role     | Read | Edit | Mint share links |
 | -------- | :--: | :--: | :--------------: |
@@ -98,6 +103,7 @@ it. An access token is required before the WebSocket accepts `join`.
 | Method | Path                     | Purpose                             |
 | ------ | ------------------------ | ----------------------------------- |
 | `POST` | `/api/auth/guest`        | Create a guest session              |
+| `POST` | `/api/auth/profile`      | Rename the signed-in guest          |
 | `POST` | `/api/rooms`             | Create a room and its owner         |
 | `GET`  | `/api/rooms`             | List the caller's rooms             |
 | `GET`  | `/api/rooms/:id`         | Fetch a room if the caller can read |
@@ -224,7 +230,7 @@ http://localhost:5173/?room=room_…&ws=ws://localhost:8080/ws&name=Ada&invite=�
 | --------- | ------------------------------------------------------------ | ------------------------ |
 | `room`    | The room to join                                             | `demo`                   |
 | `ws`      | Where the gateway lives                                      | `ws://localhost:8080/ws` |
-| `name`    | Display name                                                 | a random guest name      |
+| `name`    | Initial display name (editable in the room header)           | a random guest name      |
 | `invite`  | Signed editor/viewer capability, normally supplied by a link | —                        |
 
 `VITE_WS_URL` sets the default gateway for a deployment. If the HTTP API is

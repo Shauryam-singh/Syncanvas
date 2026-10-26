@@ -117,6 +117,19 @@ export class PostgresStore implements Store {
     return row ? toUser(row) : null;
   }
 
+  async renameUser(id: string, displayName: string): Promise<User | null> {
+    const name = displayName.trim().slice(0, 40);
+    if (!name) return this.user(id);
+    const result = await this.pool.query<UserRow>(
+      `UPDATE users SET display_name = $2
+       WHERE id = $1
+       RETURNING id, display_name, created_at`,
+      [id, name],
+    );
+    const row = result.rows[0];
+    return row ? toUser(row) : null;
+  }
+
   async createDocument(input: {
     id: string;
     name: string;

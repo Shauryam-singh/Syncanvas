@@ -91,6 +91,21 @@ export function signInGuest(
   });
 }
 
+/** Changes the name other people see. Guests can rename themselves in place. */
+export function updateDisplayName(
+  base: string,
+  token: string,
+  displayName: string,
+  signal?: AbortSignal,
+): Promise<SessionResponse> {
+  return request<SessionResponse>(base, '/api/auth/profile', {
+    method: 'POST',
+    token,
+    body: { displayName },
+    signal,
+  });
+}
+
 export function createRoom(
   base: string,
   token: string,

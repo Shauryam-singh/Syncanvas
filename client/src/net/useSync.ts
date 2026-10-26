@@ -18,6 +18,8 @@ export interface SyncConfig {
   invite?: string;
   /** True when `?name=` was supplied, so the cached guest is not reused. */
   explicitName?: boolean;
+  /** True after signing out: show the name gate instead of creating a guest. */
+  signedOut?: boolean;
 }
 
 /**
@@ -35,6 +37,7 @@ export function readSyncConfig(search: string = window.location.search): SyncCon
     displayName: name ?? `Guest ${Math.random().toString(36).slice(2, 6)}`,
     invite: params.get('invite') ?? undefined,
     explicitName: name !== null,
+    signedOut: params.get('signedout') === '1',
   };
 }
 
@@ -56,6 +59,7 @@ export function useSync(config?: SyncConfig): void {
   const displayName = config?.displayName ?? fallback.displayName;
   const invite = config?.invite ?? fallback.invite;
   const explicitName = config?.explicitName ?? fallback.explicitName ?? false;
+  const signedOut = config?.signedOut ?? fallback.signedOut ?? false;
 
   useEffect(() => {
     let disposed = false;
@@ -69,6 +73,21 @@ export function useSync(config?: SyncConfig): void {
     store.setPresenceSender(null);
     store.setPeers([]);
     store.setError(null);
+
+    // Signing out is a deliberate stop: do not immediately mint a new guest
+    // and re-enter the room. The access gate asks for a display name first.
+    if (signedOut) {
+      store.setAccess('signedout');
+      store.setConnection('local');
+      store.setSession(null);
+      return () => {
+        disposed = true;
+        if (timeout) clearTimeout(timeout);
+        unsubscribe();
+        client?.close();
+        client = null;
+      };
+    }
 
     const server = (() => {
       try {
@@ -189,5 +208,5 @@ export function useSync(config?: SyncConfig): void {
       state.setOpSender(null);
       state.setPresenceSender(null);
     };
-  }, [url, roomId, displayName, invite, explicitName]);
+  }, [url, roomId, displayName, invite, explicitName, signedOut]);
 }
