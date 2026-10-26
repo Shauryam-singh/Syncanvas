@@ -6,18 +6,25 @@ import {
   toSceneState,
   type OpEnvelope,
   type PeerPresence,
+  type RoomRole,
   type SceneDoc,
   type SceneObject,
 } from '@syncanvas/shared';
 
-/** A client that has joined a room. */
+/** A connection that has joined a room. One user may have several sessions. */
 export interface RoomMember {
-  clientId: string;
+  /** Per-connection id; presence is keyed by this, not by user. */
+  sessionId: string;
+  /** The signed-in user behind the connection. */
+  userId: string;
+  role: RoomRole;
   displayName: string;
   color: string;
   cursor: { x: number; y: number } | null;
   selection: string[];
   joinedAt: number;
+  /** Refreshed by presence, operations, sync and heartbeats. */
+  lastSeen: number;
 }
 
 export interface Room {
@@ -32,7 +39,10 @@ export interface Room {
   doc: SceneDoc;
   /** Sequence number of the last accepted batch (the broadcast watermark). */
   seq: number;
+  /** Members keyed by session id. */
   members: Map<string, RoomMember>;
+  /** Number of accepted operations since the last persisted snapshot. */
+  opsSinceSnapshot: number;
 }
 
 export interface ApplyResult {
@@ -52,8 +62,8 @@ export interface RoomSnapshot {
 /**
  * The in-memory room registry — the gateway's brain.
  *
- * Deliberately free of any WebSocket code so the merge semantics can be
- * unit tested on their own.
+ * Deliberately free of any WebSocket or database code so merge semantics,
+ * roles and presence TTLs can be unit tested on their own.
  */
 export class RoomRegistry {
   private readonly rooms = new Map<string, Room>();
@@ -67,8 +77,25 @@ export class RoomRegistry {
       doc: createDoc(createInitialScene()),
       seq: 0,
       members: new Map(),
+      opsSinceSnapshot: 0,
     };
     this.rooms.set(roomId, room);
+    return room;
+  }
+
+  /**
+   * Replaces (or creates) a room with a document loaded from persistence.
+   * Used on startup after replaying the operation log.
+   */
+  installRoom(input: { id: string; doc: SceneDoc; seq: number }): Room {
+    const room: Room = {
+      id: input.id,
+      doc: input.doc,
+      seq: input.seq,
+      members: this.rooms.get(input.id)?.members ?? new Map(),
+      opsSinceSnapshot: 0,
+    };
+    this.rooms.set(input.id, room);
     return room;
   }
 
@@ -76,25 +103,77 @@ export class RoomRegistry {
     return this.rooms.get(roomId);
   }
 
-  /** Adds a member to a room. Re-joining replaces the previous membership. */
+  all(): Room[] {
+    return [...this.rooms.values()];
+  }
+
+  /** Adds a member to a room. Re-joining replaces the previous session. */
   join(roomId: string, member: RoomMember): Room {
     const room = this.ensureRoom(roomId);
-    room.members.set(member.clientId, member);
+    room.members.set(member.sessionId, member);
     return room;
   }
 
   /** Removes a member. The room itself is kept so its state survives. */
-  leave(roomId: string, clientId: string): void {
-    this.rooms.get(roomId)?.members.delete(clientId);
+  leave(roomId: string, sessionId: string): void {
+    this.rooms.get(roomId)?.members.delete(sessionId);
   }
 
-  /** Removes a client from every room it joined (used on disconnect). */
-  leaveAll(clientId: string): string[] {
+  /** Removes a session from every room it joined (used on disconnect). */
+  leaveAll(sessionId: string): string[] {
     const left: string[] = [];
     for (const room of this.rooms.values()) {
-      if (room.members.delete(clientId)) left.push(room.id);
+      if (room.members.delete(sessionId)) left.push(room.id);
     }
     return left;
+  }
+
+  roleOf(roomId: string, sessionId: string): RoomRole | null {
+    return this.rooms.get(roomId)?.members.get(sessionId)?.role ?? null;
+  }
+
+  /** Marks a session as alive. Returns the member, if still in the room. */
+  touch(roomId: string, sessionId: string, now = Date.now()): RoomMember | null {
+    const member = this.rooms.get(roomId)?.members.get(sessionId);
+    if (member) member.lastSeen = now;
+    return member ?? null;
+  }
+
+  updatePresence(
+    roomId: string,
+    sessionId: string,
+    cursor: { x: number; y: number } | null,
+    selection: readonly string[],
+    now = Date.now(),
+  ): RoomMember | null {
+    const member = this.rooms.get(roomId)?.members.get(sessionId);
+    if (!member) return null;
+    member.cursor = cursor;
+    member.selection = [...selection];
+    member.lastSeen = now;
+    return member;
+  }
+
+  /**
+   * Drops sessions that have not been heard from within `ttlMs`.
+   *
+   * Disconnects remove the cursor immediately; this is the backstop for
+   * half-open sockets, crashed tabs and clients that stop sending heartbeats.
+   * Returns the rooms whose roster changed.
+   */
+  sweep(now = Date.now(), ttlMs = 60_000): string[] {
+    const changed: string[] = [];
+    for (const room of this.rooms.values()) {
+      let removed = false;
+      for (const [sessionId, member] of room.members) {
+        if (now - member.lastSeen > ttlMs) {
+          room.members.delete(sessionId);
+          removed = true;
+        }
+      }
+      if (removed) changed.push(room.id);
+    }
+    return changed;
   }
 
   /**
@@ -127,6 +206,7 @@ export class RoomRegistry {
     if (accepted.length > 0) {
       room.doc = mergeEnvelopes(room.doc, accepted);
       room.seq += 1;
+      room.opsSinceSnapshot += accepted.length;
     }
 
     return { seq: room.seq, accepted, duplicates };
@@ -145,14 +225,14 @@ export class RoomRegistry {
   peers(roomId: string): PeerPresence[] {
     const room = this.rooms.get(roomId);
     if (!room) return [];
-    const now = Date.now();
     return [...room.members.values()].map((member) => ({
-      userId: member.clientId,
+      sessionId: member.sessionId,
+      userId: member.userId,
       displayName: member.displayName,
       color: member.color,
       cursor: member.cursor,
-      selection: member.selection,
-      lastSeen: now,
+      selection: [...member.selection],
+      lastSeen: member.lastSeen,
     }));
   }
 }

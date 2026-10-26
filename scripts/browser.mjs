@@ -55,12 +55,23 @@ export function launchBrowser() {
 /**
  * Console noise that is expected and must not fail a smoke test.
  *
- * The editor dials the gateway on start-up. When the gateway is not running
- * the browser logs the refused connection, which is a normal situation and
- * not a bug in the editor.
+ * The editor probes the HTTP API and dials the WebSocket on start-up. When the
+ * gateway is not running — which is exactly the situation `npm run smoke`
+ * covers — the browser logs the refused connection. The editor then falls back
+ * to local mode, so this is a normal situation, not a bug.
  */
+const EXPECTED_NETWORK_ERRORS = [
+  'net::ERR_CONNECTION_REFUSED',
+  'net::ERR_NAME_NOT_RESOLVED',
+  'net::ERR_CONNECTION_TIMED_OUT',
+  'net::ERR_ABORTED',
+];
+
 export function isExpectedNoise(text) {
-  return text.includes('WebSocket connection to');
+  return (
+    text.includes('WebSocket connection to') ||
+    EXPECTED_NETWORK_ERRORS.some((fragment) => text.includes(fragment))
+  );
 }
 
 /** Collects the console errors of a page, ignoring the expected noise. */

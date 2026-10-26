@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { getObjectsInOrder, type Point, type ResizeHandle } from '@syncanvas/shared';
 import { useSceneStore } from '../store/sceneStore';
 import { ObjectShape } from './ObjectShape';
+import { PeerLayer } from './PeerLayer';
 import { SelectionOverlay } from './SelectionOverlay';
 import { screenToWorld, zoomAtPoint, type ViewTransform } from './viewport';
 
@@ -168,9 +169,11 @@ export function SceneCanvas() {
     }
 
     const store = useSceneStore.getState();
-    if (!store.interaction) return;
     const world = toWorld(event);
-    if (!world) return;
+    // Cursor presence is independent of gestures: pointing at the canvas is
+    // enough. The sync client throttles it; local mode ignores it.
+    if (world) store.reportCursor(world);
+    if (!store.interaction || !world) return;
     store.updateInteraction(world, { shift: event.shiftKey, alt: event.altKey });
   };
 
@@ -200,6 +203,7 @@ export function SceneCanvas() {
       onPointerMove={handlePointerMove}
       onPointerUp={handlePointerUp}
       onPointerCancel={handlePointerUp}
+      onPointerLeave={() => useSceneStore.getState().reportCursor(null)}
     >
       <defs>
         <pattern
@@ -234,6 +238,7 @@ export function SceneCanvas() {
         </g>
 
         <SelectionOverlay objects={selectedObjects} zoom={transform.zoom} />
+        <PeerLayer zoom={transform.zoom} />
       </g>
     </svg>
   );

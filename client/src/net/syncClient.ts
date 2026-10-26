@@ -8,6 +8,8 @@ import {
   type Op,
   type OpEnvelope,
   type PeerPresence,
+  type Point,
+  type RoomRole,
   type SceneObject,
 } from '@syncanvas/shared';
 
@@ -26,10 +28,19 @@ export interface OpsMeta {
   undoable: boolean;
 }
 
+export interface JoinedInfo {
+  role: RoomRole;
+  roomName: string;
+  sessionId: string;
+}
+
 export interface SyncClientOptions {
   url: string;
   roomId: string;
-  displayName?: string;
+  /** Signed access token from the HTTP API. */
+  token: string;
+  /** Signed share link, when the user does not have a membership yet. */
+  invite?: string;
   /** Injected in tests; defaults to the browser's WebSocket. */
   createSocket?: (url: string) => WebSocket;
   onConnection?: (state: ConnectionState) => void;
@@ -37,17 +48,34 @@ export interface SyncClientOptions {
   /** Broadcast operations, with the stamps the CRDT merge needs. */
   onOps?: (envelopes: OpEnvelope[], meta: OpsMeta) => void;
   onPeers?: (peers: PeerPresence[]) => void;
+  /** The gateway accepted the join and told us our role. */
+  onJoined?: (info: JoinedInfo) => void;
   onError?: (message: string) => void;
+  /** The session is invalid/expired; the socket is not retried. */
+  onUnauthorized?: (message: string) => void;
+  /** The join was refused (no membership, or a bad share link). */
+  onAccessDenied?: (message: string) => void;
 }
 
 const RECONNECT_BASE_MS = 500;
 const RECONNECT_MAX_MS = 10_000;
+
+/** At most 25 cursor updates per second, trailing edge. */
+const PRESENCE_INTERVAL_MS = 40;
+
+/** Keeps presence alive when the user is idle. */
+const HEARTBEAT_INTERVAL_MS = 20_000;
 
 interface OutboxEntry {
   envelope: OpEnvelope;
   undoable: boolean;
   /** True once the operation has been handed to the gateway. */
   sent: boolean;
+}
+
+interface PresenceState {
+  cursor: Point | null;
+  selection: string[];
 }
 
 /**
@@ -59,17 +87,22 @@ interface OutboxEntry {
  * the envelopes back, so that its scene is always a prefix of the replicated
  * document and the undo stack has a single source of truth.
  *
- * The price is a round trip of latency on every edit. Local-first apply is
- * stage 5; the CRDT merge already supports it.
+ * Cursor updates are ephemeral: they are coalesced to ~25 Hz here, and the
+ * server only ever gossips them to the room. They never enter the operation
+ * log and never touch the document.
  */
 export class SyncClient {
   private readonly options: SyncClientOptions;
   private socket: WebSocket | null = null;
   private closed = false;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private heartbeat: ReturnType<typeof setInterval> | null = null;
+  private presenceTimer: ReturnType<typeof setTimeout> | null = null;
   private attempts = 0;
   private clock: HlcTimestamp;
   private userId: string | null = null;
+  private sessionId: string | null = null;
+  private role: RoomRole | null = null;
   /** The last sequence number this client has applied. */
   private lastSeq = -1;
   /** Operations received out of order, keyed by sequence number. */
@@ -82,6 +115,10 @@ export class SyncClient {
   private needsResync = false;
   private awaitingResync = false;
   private joined = false;
+  private lastCursor: Point | null = null;
+  private pendingPresence: PresenceState | null = null;
+  private lastPresenceKey = '';
+  private lastPresenceAt = 0;
 
   constructor(options: SyncClientOptions) {
     this.options = options;
@@ -107,7 +144,7 @@ export class SyncClient {
 
     socket.onopen = () => {
       this.attempts = 0;
-      this.send({ t: 'auth', token: 'dev', displayName: this.options.displayName });
+      this.send({ t: 'auth', token: this.options.token });
     };
 
     socket.onmessage = (event: MessageEvent) => {
@@ -117,6 +154,10 @@ export class SyncClient {
     socket.onclose = () => {
       this.socket = null;
       this.joined = false;
+      // Sequence numbers are per connection: anything buffered from the old
+      // socket must never be spliced into the new connection's stream.
+      this.pending.clear();
+      this.stopHeartbeat();
       if (this.closed) return;
       this.needsResync = true;
       this.setConnection('offline');
@@ -131,12 +172,10 @@ export class SyncClient {
   /** Closes the connection for good. */
   close(): void {
     this.closed = true;
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
+    this.clearTimers();
     this.socket?.close();
     this.socket = null;
+    this.joined = false;
     this.setConnection('local');
   }
 
@@ -149,6 +188,10 @@ export class SyncClient {
    */
   sendOps(ops: readonly Op[], meta: { undoable: boolean }): void {
     if (ops.length === 0) return;
+    if (this.role === 'viewer') {
+      this.options.onError?.('Viewers cannot edit this room.');
+      return;
+    }
     const actorId = this.userId ?? 'local';
     const envelopes = ops.map((op) => this.createEnvelope(op, actorId));
     for (const envelope of envelopes) {
@@ -158,15 +201,16 @@ export class SyncClient {
     this.flushOutbox();
   }
 
-  /** Sends the ephemeral cursor/selection state. Never persisted. */
-  sendPresence(cursor: { x: number; y: number } | null, selection: readonly string[]): void {
-    if (!this.joined) return;
-    this.send({
-      t: 'presence',
-      roomId: this.options.roomId,
-      cursor,
-      selection: [...selection],
-    });
+  /**
+   * Sends the ephemeral cursor/selection state. Never persisted.
+   *
+   * `cursor: undefined` keeps the last cursor — selection-only updates do not
+   * make the pointer jump back to the last position it was drawn at.
+   */
+  sendPresence(cursor: Point | null | undefined, selection: readonly string[]): void {
+    if (cursor !== undefined) this.lastCursor = cursor;
+    this.pendingPresence = { cursor: this.lastCursor, selection: [...selection] };
+    this.schedulePresence();
   }
 
   // -------------------------------------------------------------------------
@@ -213,6 +257,83 @@ export class SyncClient {
     }, delay);
   }
 
+  /**
+   * A rejected session is not retried: retrying with the same token would
+   * loop forever. The UI signs in again instead.
+   */
+  private failBeforeJoin(message: string, reason: 'unauthorized' | 'forbidden'): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.clearTimers();
+    this.joined = false;
+    this.setConnection('offline');
+    if (reason === 'unauthorized') {
+      this.options.onUnauthorized?.(message);
+    } else {
+      this.options.onAccessDenied?.(message);
+    }
+    const socket = this.socket;
+    this.socket = null;
+    socket?.close();
+  }
+
+  private clearTimers(): void {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (this.presenceTimer) {
+      clearTimeout(this.presenceTimer);
+      this.presenceTimer = null;
+    }
+    this.stopHeartbeat();
+  }
+
+  private startHeartbeat(): void {
+    this.stopHeartbeat();
+    const timer = setInterval(() => this.send({ t: 'ping' }), HEARTBEAT_INTERVAL_MS);
+    // Tests run in Node; unref so an idle client cannot keep the process alive.
+    (timer as unknown as { unref?: () => void }).unref?.();
+    this.heartbeat = timer;
+  }
+
+  private stopHeartbeat(): void {
+    if (!this.heartbeat) return;
+    clearInterval(this.heartbeat);
+    this.heartbeat = null;
+  }
+
+  private schedulePresence(): void {
+    if (!this.joined || !this.pendingPresence || this.presenceTimer) return;
+    const wait = Math.max(0, PRESENCE_INTERVAL_MS - (Date.now() - this.lastPresenceAt));
+    if (wait === 0) {
+      this.flushPresence();
+      return;
+    }
+    const timer = setTimeout(() => {
+      this.presenceTimer = null;
+      this.flushPresence();
+    }, wait);
+    (timer as unknown as { unref?: () => void }).unref?.();
+    this.presenceTimer = timer;
+  }
+
+  private flushPresence(): void {
+    if (!this.joined || !this.pendingPresence) return;
+    const pending = this.pendingPresence;
+    this.pendingPresence = null;
+    const key = JSON.stringify([pending.cursor, pending.selection]);
+    if (key === this.lastPresenceKey) return;
+    this.lastPresenceKey = key;
+    this.lastPresenceAt = Date.now();
+    this.send({
+      t: 'presence',
+      roomId: this.options.roomId,
+      cursor: pending.cursor,
+      selection: pending.selection,
+    });
+  }
+
   private handleRaw(raw: string): void {
     const message = parseServerMessage(raw);
     if (!message) {
@@ -223,15 +344,25 @@ export class SyncClient {
     switch (message.t) {
       case 'welcome': {
         this.userId = message.userId;
+        this.sessionId = message.sessionId;
         this.clock = createHlc(message.userId);
-        this.send({ t: 'join', roomId: this.options.roomId });
+        this.send({ t: 'join', roomId: this.options.roomId, invite: this.options.invite });
         return;
       }
 
       case 'joined': {
         this.joined = true;
+        this.role = message.role;
+        this.lastSeq = message.snapshotSeq;
+        this.startHeartbeat();
         this.setConnection('live');
+        this.options.onJoined?.({
+          role: message.role,
+          roomName: message.name,
+          sessionId: this.sessionId ?? '',
+        });
         this.flushOutbox();
+        this.schedulePresence();
         return;
       }
 
@@ -279,6 +410,22 @@ export class SyncClient {
       }
 
       case 'error': {
+        if (message.code === 'unauthorized') {
+          this.failBeforeJoin(message.message, 'unauthorized');
+          return;
+        }
+        if (!this.joined && message.code === 'forbidden') {
+          this.failBeforeJoin(message.message, 'forbidden');
+          return;
+        }
+        if (message.code === 'forbidden' && message.opIds) {
+          // A rejected batch is not retried; dropping it here also clears the
+          // "undoable" flag so a later undo cannot resurrect a stale gesture.
+          for (const id of message.opIds) {
+            this.outbox.delete(id);
+            this.undoableIds.delete(id);
+          }
+        }
         this.options.onError?.(message.message);
         return;
       }

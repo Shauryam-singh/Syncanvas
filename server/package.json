@@ -5,18 +5,21 @@
   "type": "module",
   "main": "./dist/index.js",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node -e \"require('node:fs').copyFileSync('src/store/schema.sql','dist/store/schema.sql')\"",
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
+    "migrate": "tsx src/store/migrate.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run"
   },
   "dependencies": {
     "@syncanvas/shared": "*",
+    "pg": "^8.23.1",
     "ws": "^8.18.3"
   },
   "devDependencies": {
     "@types/node": "^26.6.5",
+    "@types/pg": "^8.23.1",
     "@types/ws": "^8.18.1",
     "tsx": "^4.23.15",
     "typescript": "^6.0.3",

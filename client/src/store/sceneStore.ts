@@ -20,6 +20,7 @@ import {
   type PeerPresence,
   type Point,
   type ResizeHandle,
+  type RoomRole,
   type SceneDoc,
   type SceneObject,
   type SceneObjectType,
@@ -30,6 +31,20 @@ import type { ConnectionState } from '../net/syncClient';
 export type Tool = 'select' | SceneObjectType;
 
 /**
+ * Where the editor is in the access flow.
+ *
+ * `checking` is a real state, not a transient detail: editing is disabled
+ * until the gateway has told us the role, so a viewer cannot race the server
+ * by drawing during the handshake.
+ */
+export type AccessState = 'local' | 'checking' | 'granted' | 'denied';
+
+export interface SessionIdentity {
+  userId: string;
+  displayName: string;
+}
+
+/**
  * Where local operations go.
  *
  * `null` means "apply them here and now" — the single-user behaviour of
@@ -37,6 +52,12 @@ export type Tool = 'select' | SceneObjectType;
  * the sync client instead, and they come back in the gateway's order.
  */
 export type OpSender = (ops: Op[], meta: { undoable: boolean }) => void;
+
+/**
+ * Where ephemeral cursor/selection updates go. `null` in local mode.
+ * These never become operations and are never persisted.
+ */
+export type PresenceSender = (cursor: Point | null, selection: string[]) => void;
 
 export interface MoveInteraction {
   kind: 'move';
@@ -98,6 +119,24 @@ export interface SceneStore {
   peers: PeerPresence[];
   /** Where local operations are sent; `null` means "apply them locally". */
   opSender: OpSender | null;
+  /** Where cursor/selection updates are sent; `null` in local mode. */
+  presenceSender: PresenceSender | null;
+  /** The signed-in guest, or `null` when running without a gateway. */
+  session: SessionIdentity | null;
+  /** The role the gateway assigned in this room. */
+  role: RoomRole | null;
+  /** Access gate for this room. */
+  access: AccessState;
+  /** The id of the room being edited (also encoded in the URL). */
+  roomId: string;
+  /** The server's name for the room. */
+  roomName: string;
+  /** The per-connection id, used to recognise our own presence. */
+  selfSessionId: string | null;
+  /** Why access was refused, shown by the access gate. */
+  accessMessage: string | null;
+  /** The last gateway/API error, shown in the room panel. */
+  lastError: string | null;
 
   /** Applies operations as a single undoable step. */
   dispatch: (ops: Op[]) => void;
@@ -110,6 +149,14 @@ export interface SceneStore {
   setConnection: (connection: ConnectionState) => void;
   setPeers: (peers: PeerPresence[]) => void;
   setOpSender: (sender: OpSender | null) => void;
+  setPresenceSender: (sender: PresenceSender | null) => void;
+  setSession: (session: SessionIdentity | null) => void;
+  setJoined: (info: { role: RoomRole; roomName: string; sessionId: string }) => void;
+  setRoomId: (roomId: string) => void;
+  setAccess: (access: AccessState, message?: string | null) => void;
+  setError: (message: string | null) => void;
+  /** Reports this client's cursor. Ephemeral; never an operation. */
+  reportCursor: (cursor: Point | null) => void;
 
   createObject: (type: SceneObjectType, point: Point) => void;
   updateObject: (id: string, changes: EditableProps) => void;
@@ -133,6 +180,20 @@ export interface SceneStore {
   undo: () => void;
   redo: () => void;
 }
+
+/**
+ * Whether this client may change the scene.
+ *
+ * The server is authoritative (a viewer's operations are rejected there);
+ * this only mirrors that decision so the UI does not offer controls that
+ * would do nothing. `checking` is deliberately read-only.
+ */
+export function canEdit(state: Pick<SceneStore, 'access' | 'role'>): boolean {
+  return state.access === 'local' || (state.access === 'granted' && state.role !== 'viewer');
+}
+
+/** Stable selector so components do not re-render on every store change. */
+export const selectCanEdit = (state: SceneStore): boolean => canEdit(state);
 
 /**
  * Computes the operations that undo a group of operations.
@@ -217,9 +278,19 @@ export const useSceneStore = create<SceneStore>((set, get) => ({
   connection: 'local',
   peers: [],
   opSender: null,
+  presenceSender: null,
+  session: null,
+  role: null,
+  access: 'local',
+  roomId: 'demo',
+  roomName: 'Demo canvas',
+  selfSessionId: null,
+  accessMessage: null,
+  lastError: null,
 
   dispatch: (ops) => {
     if (ops.length === 0) return;
+    if (!canEdit(get())) return;
     const sender = get().opSender;
     if (sender) {
       // Connected: the operation is stamped, sent, and merged when the
@@ -278,8 +349,32 @@ export const useSceneStore = create<SceneStore>((set, get) => ({
   setConnection: (connection) => set({ connection }),
   setPeers: (peers) => set({ peers }),
   setOpSender: (opSender) => set({ opSender }),
+  setPresenceSender: (presenceSender) => set({ presenceSender }),
+  setSession: (session) => set({ session }),
+  setJoined: ({ role, roomName, sessionId }) =>
+    set({
+      role,
+      roomName,
+      selfSessionId: sessionId,
+      access: 'granted',
+      accessMessage: null,
+      lastError: null,
+    }),
+  setRoomId: (roomId) => set({ roomId }),
+  setAccess: (access, message = null) =>
+    set({
+      access,
+      accessMessage: message,
+      ...(access === 'denied' ? { selection: [], interaction: null, draft: [] } : {}),
+    }),
+  setError: (lastError) => set({ lastError }),
+  reportCursor: (cursor) => {
+    const { presenceSender, selection } = get();
+    presenceSender?.(cursor, selection);
+  },
 
   createObject: (type, point) => {
+    if (!canEdit(get())) return;
     const size = DEFAULT_SIZE[type];
     const object = createSceneObject({
       id: newId('obj'),
@@ -310,6 +405,7 @@ export const useSceneStore = create<SceneStore>((set, get) => ({
   },
 
   deleteSelected: () => {
+    if (!canEdit(get())) return;
     const { selection } = get();
     if (selection.length === 0) return;
     get().dispatch(selection.map((id) => ({ kind: 'deleteObject', objectId: id })));
@@ -398,6 +494,7 @@ export const useSceneStore = create<SceneStore>((set, get) => ({
   },
 
   beginMove: (objectIds, pointer) => {
+    if (!canEdit(get())) return;
     const { scene } = get();
     const startObjects = getObjectsInOrder(scene).filter((object) => objectIds.includes(object.id));
     if (startObjects.length === 0) return;
@@ -408,6 +505,7 @@ export const useSceneStore = create<SceneStore>((set, get) => ({
   },
 
   beginResize: (objectId, handle, pointer, modifiers) => {
+    if (!canEdit(get())) return;
     const object = get().scene.objects.get(objectId);
     if (!object) return;
     set({
@@ -425,6 +523,7 @@ export const useSceneStore = create<SceneStore>((set, get) => ({
   },
 
   beginRotate: (objectId, pointer) => {
+    if (!canEdit(get())) return;
     const object = get().scene.objects.get(objectId);
     if (!object) return;
     set({
@@ -529,6 +628,7 @@ export const useSceneStore = create<SceneStore>((set, get) => ({
   cancelInteraction: () => set({ interaction: null, draft: [] }),
 
   undo: () => {
+    if (!canEdit(get())) return;
     const { undoStack, redoStack, opSender } = get();
     const entry = undoStack[undoStack.length - 1];
     if (!entry) return;
@@ -555,6 +655,7 @@ export const useSceneStore = create<SceneStore>((set, get) => ({
   },
 
   redo: () => {
+    if (!canEdit(get())) return;
     const { undoStack, redoStack, opSender } = get();
     const entry = redoStack[redoStack.length - 1];
     if (!entry) return;

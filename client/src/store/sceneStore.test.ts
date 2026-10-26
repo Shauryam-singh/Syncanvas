@@ -39,6 +39,15 @@ function reset(objects: SceneObject[] = []) {
     connection: 'local',
     peers: [],
     opSender: null,
+    presenceSender: null,
+    session: null,
+    role: null,
+    access: 'local',
+    roomId: 'demo',
+    roomName: 'Demo canvas',
+    selfSessionId: null,
+    accessMessage: null,
+    lastError: null,
   });
 }
 
@@ -215,6 +224,113 @@ describe('connected mode', () => {
 
     expect(sent).toHaveLength(3);
     expect(sent[2]?.ops).toEqual([{ kind: 'setProp', objectId: 'a', prop: 'x', value: 5 }]);
+  });
+});
+
+describe('access control', () => {
+  const object: SceneObject = {
+    id: 'a',
+    type: 'rect',
+    x: 0,
+    y: 0,
+    w: 10,
+    h: 10,
+    rotation: 0,
+    fill: '#fff',
+    zIndex: 0,
+  };
+
+  it('records the role and room the gateway assigned', () => {
+    reset();
+    store().setJoined({ role: 'owner', roomName: 'Design review', sessionId: 'sess_1' });
+
+    expect(store().access).toBe('granted');
+    expect(store().role).toBe('owner');
+    expect(store().roomName).toBe('Design review');
+    expect(store().selfSessionId).toBe('sess_1');
+  });
+
+  it('blocks every edit while the access check is in flight', () => {
+    reset([object]);
+    store().setAccess('checking');
+
+    store().createObject('rect', { x: 100, y: 100 });
+    store().updateObject('a', { x: 42 });
+    store().deleteSelected();
+    store().dispatch([{ kind: 'setProp', objectId: 'a', prop: 'x', value: 9 }]);
+
+    expect(store().scene.objects.size).toBe(1);
+    expect(store().scene.objects.get('a')?.x).toBe(0);
+    expect(store().undoStack).toHaveLength(0);
+  });
+
+  it('blocks edits from a viewer and leaves the scene untouched', () => {
+    reset([object]);
+    store().setJoined({ role: 'viewer', roomName: 'Design review', sessionId: 'sess_1' });
+    store().setSelection(['a']);
+
+    store().updateObject('a', { x: 42 });
+    store().updateObject('a', { fill: '#000' });
+    store().deleteSelected();
+    store().reorderSelection('front');
+    store().dispatch([{ kind: 'setProp', objectId: 'a', prop: 'x', value: 9 }]);
+    store().undo();
+
+    expect(store().scene.objects.get('a')?.x).toBe(0);
+    expect(store().scene.objects.get('a')?.fill).toBe('#fff');
+    expect(store().scene.objects.size).toBe(1);
+    expect(store().selection).toEqual(['a']);
+    expect(store().undoStack).toHaveLength(0);
+  });
+
+  it('does not start a drag gesture for a viewer', () => {
+    reset([object]);
+    store().setJoined({ role: 'viewer', roomName: 'Design review', sessionId: 'sess_1' });
+
+    store().beginMove(['a'], { x: 0, y: 0 });
+    expect(store().interaction).toBeNull();
+  });
+
+  it('lets an editor edit', () => {
+    reset([object]);
+    store().setJoined({ role: 'editor', roomName: 'Design review', sessionId: 'sess_1' });
+
+    store().updateObject('a', { x: 42 });
+    expect(store().scene.objects.get('a')?.x).toBe(42);
+    expect(store().undoStack).toHaveLength(1);
+  });
+
+  it('clears the selection when access is denied', () => {
+    reset([object]);
+    store().setSelection(['a']);
+    store().beginMove(['a'], { x: 0, y: 0 });
+
+    store().setAccess('denied', 'No access');
+
+    expect(store().access).toBe('denied');
+    expect(store().accessMessage).toBe('No access');
+    expect(store().selection).toEqual([]);
+    expect(store().interaction).toBeNull();
+  });
+
+  it('reports the cursor with the current selection', () => {
+    reset();
+    const calls: Array<{ cursor: { x: number; y: number } | null; selection: string[] }> = [];
+    store().setPresenceSender((cursor, selection) => calls.push({ cursor, selection }));
+    store().setSelection(['a']);
+
+    store().reportCursor({ x: 12, y: 34 });
+    store().reportCursor(null);
+
+    expect(calls).toEqual([
+      { cursor: { x: 12, y: 34 }, selection: ['a'] },
+      { cursor: null, selection: ['a'] },
+    ]);
+  });
+
+  it('does nothing when there is no presence channel (local mode)', () => {
+    reset();
+    expect(() => store().reportCursor({ x: 1, y: 2 })).not.toThrow();
   });
 });
 

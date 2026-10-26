@@ -2,134 +2,171 @@
 
 Real-time collaborative scene editor — a "Figma-lite" multiplayer canvas where
 several people place, move, transform and style objects at once, with live
-cursors, offline editing and version history. The merge logic (LWW-map CRDT +
-RGA + hybrid logical clocks) is implemented from scratch, not wrapped around
-Yjs.
+cursors, selection highlights and access-controlled rooms. The merge logic
+(LWW-map CRDT + RGA + hybrid logical clocks) is implemented from scratch, not
+wrapped around Yjs.
 
-**Status: Stage 3 — the hand-rolled CRDT.** The editor renders rectangles,
-ellipses, lines and text; supports select, drag, resize, rotate and z-order;
-expresses every edit as an operation; and syncs those operations through a
-Node.js WebSocket gateway. Every operation is stamped with a hybrid logical
-clock and merged through the same dependency-free CRDT in `shared/src/crdt/`:
-an LWW register per object property, delete-wins tombstones and an RGA for
-z-order. The gateway still relays and numbers batches, but it no longer decides
-the winner — two replicas that have seen the same operations converge to the
-same scene whatever order they arrived in. See
-[docs/DESIGN.md](docs/DESIGN.md) for the full technical design (data model,
-wire protocol, CRDT semantics, scaling plan).
+**Status: Stage 4 — a usable multi-user product.** Guests sign in without a
+password, create rooms, and share editor or viewer links. The gateway
+authenticates every socket, enforces roles, fans out ephemeral presence, and
+persists accepted operations to Postgres. A room survives a gateway restart;
+a viewer cannot edit on the server even if the client UI is bypassed.
 
 ## Progress
 
-| Stage | Scope                                      | Status |
-| ----- | ------------------------------------------ | ------ |
-| 0     | Monorepo, compose, CI, design doc          | ✅     |
-| 1     | Canvas, transform maths, op pipeline       | ✅     |
-| 2     | WebSocket gateway, naive LWW sync          | ✅     |
-| 3     | CRDT core (LWW-map, RGA, tombstones), fuzz | ✅     |
-| 4     | Redis pub/sub, Postgres log, JWT rooms     | ⬜     |
-| 5     | Offline outbox, text RGA, version restore  | ⬜     |
-| 6     | Load tests, Docker, AWS deploy, README     | ⬜     |
+| Stage | Scope                                             | Status |
+| ----- | ------------------------------------------------- | ------ |
+| 0     | Monorepo, compose, CI, design doc                 | ✅     |
+| 1     | Canvas, transform maths, op pipeline              | ✅     |
+| 2     | WebSocket gateway, naive LWW sync                 | ✅     |
+| 3     | CRDT core (LWW-map, RGA, tombstones), fuzz        | ✅     |
+| 4     | Presence, rooms, guest auth, roles, Postgres      | ✅     |
+| 5     | Durable offline outbox, text RGA, version restore | ⬜     |
+| 6     | Redis fan-out, Docker deploy, load tests          | ⬜     |
 
-## Stage 1 checklist
+## Stage 4 checklist
 
-- [x] Render rectangles, ellipses, lines and text (SVG canvas)
-- [x] Select, drag, resize, rotate and change z-order
-- [x] Local state store (Zustand)
-- [x] Every edit expressed as an operation (`setProp`, `createObject`, …)
-- [x] Unit tests for the transform maths (rotate/resize around the centre, hit-testing)
-- [x] Applying the same operation sequence twice yields identical state
-- [x] 500 objects stay at 60 fps (verified by the browser smoke test)
+- [x] Live cursors and selection highlights as ephemeral messages
+- [x] Cursor updates throttled to ~25 Hz on the client; peer cursors interpolated
+- [x] Guest JWT auth, room creation and share links
+- [x] Server-enforced `owner` / `editor` / `viewer` roles
+- [x] Postgres schema for users, documents, memberships, operations, snapshots
+- [x] Viewer edits rejected server-side; the UI is read-only too
+- [x] Expired and tampered tokens refused
+- [x] A cursor disappears as soon as its socket closes
+- [x] No access to a real room without membership or a signed link
+- [x] Durable rooms: the latest snapshot plus later operations survive a restart
 
-## Stage 2 checklist
+Stage 1–3 remain complete: the canvas has rect/ellipse/line/text, drag, resize,
+rotate and z-order; every edit is an operation; the gateway and every client
+merge through the same CRDT; 10,000 randomized delivery schedules converge.
 
-- [x] WebSocket gateway (`ws`) with room join/leave
-- [x] Operations broadcast to the room and acknowledged to the author
-- [x] Server-assigned client ids — a client cannot forge an identity
-- [x] Reconnect with a re-sync: nothing is lost, nothing is applied twice
-- [x] Naive server-arrival-order LWW sync, convergent by construction
-- [x] Two browsers on one canvas (verified by the two-browser smoke test)
-
-## Stage 3 checklist
-
-- [x] Hybrid logical clock (`wall`, `counter`, `actorId`) with a total order
-- [x] LWW register per object property, keyed by `(value, HLC, opId)`
-- [x] Deterministic tie-break: the HLC first, then the operation id
-- [x] Delete-wins tombstones; a strictly later create resurrects the object (undo)
-- [x] RGA for the z-order, with explicit top/bottom origins, dead-node hinges
-      and deterministic cycle breaking
-- [x] Idempotent, commutative and associative `mergeEnvelope`
-- [x] Pure, dependency-free module in `shared/src/crdt/` (no Yjs)
-- [x] Unit tests for the register, the RGA and the document
-- [x] Property tests (fast-check): 10,000 randomized schedules, shuffled and
-      duplicated delivery, all replicas converging
-- [x] Clock-skew test: a replica 10 minutes ahead converges and does not win forever
-- [x] The gateway and the editor both merge through the CRDT
-
-### How it works
+## How it works
 
 ```
-pointer event ──► canvas ──► store ──► mergeEnvelope() ──► CRDT document
-                                                              │
-                                          scene projection ◄──┘──► render
+pointer event ──► canvas ──► store ──► outbox ──► gateway ──► room.mergeEnvelopes()
+                       ▲                                │
+                       └────── echo (same envelopes) ◄──┘
 ```
 
-A drag still produces a transient _draft_ while the pointer moves, and a single
-`setProp` operation when the gesture ends. The rule that shapes the whole
-codebase: **nothing mutates an object directly**. That is what makes undo,
-replay, offline merging and CRDT convergence possible.
+- **Every edit is an operation.** A gesture becomes a `createObject`,
+  `deleteObject` or one or more `setProp` operations.
+- **Conflicts resolve by version, not arrival order.** Each envelope carries an
+  HLC and an operation id; the LWW register picks the maximum
+  `(wall, counter, actorId, opId)`. The z-order is an RGA.
+- **The gateway is a relay and a replica.** It merges the same code path as the
+  browser, assigns a broadcast watermark (`seq`) and fans the batch out to the
+  author as well.
+- **No optimistic apply.** In live mode the author waits for the echo, so the
+  rendered scene is always a prefix of the replicated document. Local-first
+  apply is Stage 5.
+- **Reconnects are catch-up, not replay of history.** A client sends
+  `sync {snapshotSeq, opIds}`; the gateway acknowledges what it already has and
+  sends the current projection plus later operations. Unacknowledged outbox
+  entries are re-sent (deduped by operation id).
 
-With the gateway connected, the store does not apply its own operations
-optimistically. It stamps them and sends them; the gateway merges them into the
-room's document and echoes the same envelopes back:
+See [docs/DESIGN.md](docs/DESIGN.md) for the CRDT semantics, protocol, schema,
+presence model and tradeoffs.
 
+## Rooms, auth and roles
+
+There are no passwords. `POST /api/auth/guest` mints a short-lived identity and
+an access token in one step; the browser caches it for the gateway that issued
+it. An access token is required before the WebSocket accepts `join`.
+
+| Role     | Read | Edit | Mint share links |
+| -------- | :--: | :--: | :--------------: |
+| `owner`  |  ✅  |  ✅  |        ✅        |
+| `editor` |  ✅  |  ✅  |        ✅        |
+| `viewer` |  ✅  |  ❌  |        ❌        |
+
+- **Real rooms** require a membership row or a valid signed invite for that
+  room. The gateway is authoritative; a viewer's operation batch is rejected
+  with `forbidden` and the rejected `opIds`, and the client drops them.
+- **Invites** are bearer capabilities (`editor` or `viewer`) with their own
+  expiry. Redeeming one persists a membership so reconnects and refreshes keep
+  working. A valid invite can bootstrap a missing room; this keeps share links
+  useful after an ephemeral-store restart.
+- **`demo`** is deliberately public: any signed-in guest can read and edit it.
+  Set `PUBLIC_DEMO_ROOM=` to disable it.
+- A guest identity is device-scoped. Clearing browser storage creates a new
+  guest; memberships are lost, but a share link still gets you back in. Durable
+  identity (email/OAuth) is not part of Stage 4.
+
+### HTTP API
+
+| Method | Path                     | Purpose                             |
+| ------ | ------------------------ | ----------------------------------- |
+| `POST` | `/api/auth/guest`        | Create a guest session              |
+| `POST` | `/api/rooms`             | Create a room and its owner         |
+| `GET`  | `/api/rooms`             | List the caller's rooms             |
+| `GET`  | `/api/rooms/:id`         | Fetch a room if the caller can read |
+| `POST` | `/api/rooms/:id/invites` | Mint an editor/viewer link          |
+| `GET`  | `/healthz`               | Health and the active store kind    |
+
+The API uses Bearer auth and CORS, rejects bodies over 64 KiB, and returns JSON
+errors with stable codes.
+
+## Presence
+
+Presence is ephemeral and keyed by the **per-connection session id**, so two
+tabs with the same user do not collide. The client throttles updates to 25 Hz
+(40 ms trailing edge), sends a 20 s heartbeat, and interpolates peer cursors on
+`requestAnimationFrame`. The server forwards presence at most every 15 ms,
+clamps cursor coordinates to ±100 000, caps selections at 1 000 ids, and drops
+stale sessions after 60 s (swept every 5 s). Disconnects remove the session
+immediately. Nothing in this path touches Postgres.
+
+## Persistence
+
+The gateway chooses a store at startup: `STORE=auto` uses Postgres when
+`DATABASE_URL` is reachable and falls back to the in-memory store; `STORE=memory`
+and `STORE=postgres` force one. The health endpoint reports which one is active.
+
+```sql
+users(id, display_name, created_at)
+documents(id, name, owner_id, created_at)
+memberships(document_id, user_id, role, created_at)
+operations(document_id, op_id, actor_id, seq, hlc_wall, hlc_counter, envelope, created_at)
+snapshots(id, document_id, seq, state, created_at)
 ```
-pointer event ──► store ──► outbox ──► gateway ──► room.mergeEnvelopes()
-                      ▲                                │
-                      └────── echo (same envelopes) ◄──┘
-```
 
-The gateway still assigns a sequence number to every accepted batch, but that
-number is a **broadcast watermark** (used for acknowledgements and catch-up),
-not a merge rule. The winner of a conflict is `(HLC, opId)` on every replica.
-
-Three decisions in stage 3 are worth calling out:
-
-- **Delete-wins, with resurrection.** A tombstone beats a concurrent create
-  when their logical times tie; a create that is strictly later — the undo of a
-  delete — brings the object back. Nothing is ever silently re-created by a
-  late `setProp`.
-- **The z-order is an RGA, not a number.** `zIndex` is derived from the
-  sequence, and moving an object replaces its placement with a new node.
-  Concurrent moves after the same origin are ordered by version, so both
-  replicas agree.
-- **No optimistic apply (still).** The author waits for the echo, which costs a
-  round trip but guarantees the rendered scene is always a prefix of the
-  replicated document. Local-first apply is stage 5.
+- Accepted operation envelopes are appended with a per-room serial write queue.
+- A snapshot is written every 100 operations or 60 s of activity. It stores the
+  **full CRDT document** — registers, tombstones, RGA order and seen operation
+  ids — not just the visible scene.
+- Loading a room takes the newest snapshot and replays only the operations after
+  its `seq`; if there is no snapshot, it replays the log over the seed scene.
+  The CRDT merge makes replay order-independent, and the persisted `seen` set
+  makes a late resend a no-op instead of an overwrite.
+- Shutdown flushes pending writes before releasing the pool.
+- `npm run migrate -w @syncanvas/server` applies the idempotent schema; the
+  gateway also applies it on startup.
+- The memory store is for development and tests. It is intentionally ephemeral:
+  a restart loses users, rooms and operations, and old access tokens are
+  rejected rather than admitted into a fresh store.
 
 ## Where things live
 
-- `shared/src/crdt/register.ts` — the LWW register and the `(HLC, opId)` total order.
-- `shared/src/crdt/rga.ts` — the z-order sequence: origins, sibling order, dead
-  hinges and deterministic cycle breaking.
-- `shared/src/crdt/doc.ts` — the replicated document, `mergeEnvelope`, the
-  delete-wins existence rule and the projection back to a `SceneState`.
-- `shared/src/geometry.ts` — rotation, resize-around-the-anchor, hit-testing
-  and handle placement. Pure functions, no dependencies.
-- `shared/src/scene.ts` — the scene view model and the stage-1 `applyOp` path
-  used for inverse operations and snapshots.
-- `shared/src/protocol.ts` — the wire protocol and its runtime validators; a
-  malformed frame is rejected, never coerced.
-- `shared/src/hlc.ts` — the hybrid logical clock that stamps every operation.
-- `client/src/store/sceneStore.ts` — the Zustand store. Holds the CRDT
-  document, projects it into the scene, and keeps the undo/redo stacks.
-- `client/src/net/` — the sync client (outbox, reconnect) and the hook that
-  wires it into the editor.
-- `client/src/canvas/` — the SVG canvas, the selection overlay and the
-  viewport maths.
-- `server/src/gateway.ts` — the WebSocket gateway: identities, broadcast,
-  acknowledgement.
-- `server/src/rooms.ts` — the room registry; merges every accepted envelope
-  into the room's CRDT document.
+- `shared/src/crdt/` — LWW register, RGA z-order, delete-wins document merge.
+- `shared/src/geometry.ts` — rotation, resize-around-anchor, hit-testing.
+- `shared/src/protocol.ts` — wire types and strict runtime validation.
+- `shared/src/api.ts` — HTTP request/response types.
+- `client/src/store/sceneStore.ts` — CRDT document, projection, undo/redo,
+  access/role gates and cursor reporting.
+- `client/src/net/syncClient.ts` — auth handshake, outbox, presence throttle,
+  heartbeat, reconnect and resync.
+- `client/src/net/useSync.ts` — guest bootstrap, room join, invite redemption,
+  local fallback and fatal-access handling.
+- `client/src/canvas/PeerLayer.tsx` — interpolated peer cursors and selection
+  outlines.
+- `client/src/components/RoomPanel.tsx` — room/role UI, share links, sign out.
+- `server/src/auth/jwt.ts` — dependency-free HS256 access and invite tokens.
+- `server/src/http.ts` — guest auth, rooms, invites, CORS, health.
+- `server/src/gateway.ts` — socket auth, access control, presence, operation
+  admission, viewer rejection and auth-failure close.
+- `server/src/store/` — `Store` interface, memory and Postgres implementations.
+- `server/src/persistence.ts` — room loading, snapshots, write queues, flush.
 
 ## Getting started
 
@@ -137,76 +174,99 @@ Prerequisites: Node.js ≥ 22, npm ≥ 10, Docker with Compose.
 
 ```bash
 npm install
-docker compose up -d        # Postgres :5432, Redis :6379
+docker compose up -d        # Postgres :5432 (Redis is reserved for Stage 6)
 cp .env.example .env
 npm run dev                 # shared (tsc watch) + server :8080 + client :5173
 ```
 
+`JWT_SECRET` must be changed before exposing the gateway. If Postgres is not
+running, the gateway logs the fallback and uses the memory store.
+
 Verify:
 
 ```bash
-npm run check               # lint + format:check + typecheck + tests
-npm run smoke               # browser smoke test (needs the dev server running)
-npm run smoke:sync          # two browsers on one canvas (needs client + gateway)
+npm run check               # lint + format + typecheck + all tests
+npm run smoke               # single-user browser checks (client server running)
+npm run smoke:sync          # four-browser multi-user checks (starts the gateway)
 curl http://localhost:8080/healthz
+```
+
+`smoke:sync` starts its own gateway on `:8099` but expects the client on
+`:5173`. It prints the store it found. With Postgres it also checks that the
+scene and owner survive a gateway restart; with the memory store it verifies
+that the old sessions fail closed and skips the durability phase.
+
+The Postgres integration tests are enabled by:
+
+```bash
+TEST_DATABASE_URL=postgres://syncanvas:syncanvas@localhost:5432/syncanvas_test \
+  npm run test -w @syncanvas/server
 ```
 
 ### Trying it with two people
 
-Open the editor in two browsers — or two tabs — and point them at the same
-room:
+The public sandbox needs no link:
 
 ```
 http://localhost:5173/?room=demo&name=Ada
 http://localhost:5173/?room=demo&name=Bob
 ```
 
-| Parameter | Meaning                                                | Default                  |
-| --------- | ------------------------------------------------------ | ------------------------ |
-| `room`    | The room to join — the same room means the same canvas | `demo`                   |
-| `ws`      | Where the gateway lives                                | `ws://localhost:8080/ws` |
-| `name`    | Your display name in the room                          | a random guest name      |
+For a real room, create one in the room panel ("New room"), then copy the
+**editor** or **viewer** link. Opening the link signs the new guest in and
+redeems the invite:
 
-`VITE_WS_URL` sets the default gateway for a deployment. If the gateway is
-not running the editor keeps working on its own — the status bar shows
-`Offline` and the edits stay local.
+```
+http://localhost:5173/?room=room_…&ws=ws://localhost:8080/ws&name=Ada&invite=…
+```
 
-### What stage 3 does not do yet
+| Parameter | Meaning                                                      | Default                  |
+| --------- | ------------------------------------------------------------ | ------------------------ |
+| `room`    | The room to join                                             | `demo`                   |
+| `ws`      | Where the gateway lives                                      | `ws://localhost:8080/ws` |
+| `name`    | Display name                                                 | a random guest name      |
+| `invite`  | Signed editor/viewer capability, normally supplied by a link | —                        |
 
-- **No persistence.** The rooms live in the gateway's memory, so a restart
-  brings the room back from the seed scene. The operation log and CRDT
-  snapshots land in Postgres in stage 4.
-- **No offline editing.** A client that loses the connection keeps editing
-  locally, but those edits are _not_ queued: they are lost when the client
-  reconnects and re-syncs to the room. A durable offline outbox is stage 5.
-- **No text RGA yet.** `editText` is defined and acknowledged, and the generic
-  RGA is in place, but the editor still edits whole strings through
-  `setProp('text', …)`, so concurrent typing inside one text object is
-  last-writer-wins. A per-character RGA is stage 5.
-- **No authentication.** The `auth` handshake is a placeholder; JWT rooms
-  arrive in stage 4.
-- **Tombstones are not compacted.** The delete markers are kept forever (they
-  are what makes delete-wins safe). Snapshot compaction arrives with the
-  persistent log.
-- **A joining client receives the projected scene, not the CRDT history.** That
-  is enough to converge on the operations it receives afterwards, but a full
-  state sync (tombstones and exact register versions) waits for the persisted
-  snapshot in stage 4.
+`VITE_WS_URL` sets the default gateway for a deployment. If the HTTP API is
+unreachable, the editor falls back to a local canvas so the single-user product
+still works; the status bar shows the local/offline state.
+
+## What Stage 4 does not do yet
+
+- **One gateway process.** Redis pub/sub is reserved for cross-instance fan-out
+  in Stage 6; the current gateway holds each room's replica in memory.
+- **Durable offline editing.** A dropped socket keeps the in-memory outbox and
+  replays it on reconnect, but a page reload loses unacknowledged edits. An
+  IndexedDB outbox is Stage 5.
+- **No optimistic apply.** The author still waits for the echo; local-first
+  apply is Stage 5.
+- **No text RGA.** `editText` is validated and acknowledged, but text is still a
+  whole-string LWW register. Per-character merging is Stage 5.
+- **Snapshots are internal, not named versions.** Restore/history is Stage 5.
+- **A joining client receives the projected scene, not full CRDT history.**
+  That is sufficient for the operations it receives afterwards; tombstone-aware
+  client state transfer is a later refinement.
+- **Guest identity is not durable across devices.** There are no passwords,
+  email verification or OAuth yet.
 
 ## Scripts
 
-| Script                 | What it does                                       |
-| ---------------------- | -------------------------------------------------- |
-| `npm run dev`          | Build shared, then run all three packages in watch |
-| `npm run build`        | Production build of shared → server → client       |
-| `npm run lint`         | ESLint across the workspace                        |
-| `npm run format:check` | Prettier check (CI) / `npm run format` to fix      |
-| `npm run typecheck`    | `tsc --noEmit` for server + client                 |
-| `npm run test`         | Vitest across workspaces                           |
-| `npm run smoke`        | Playwright smoke test against the running client   |
-| `npm run smoke:sync`   | Two-browser sync test (starts the gateway itself)  |
-| `npm run check`        | Everything CI runs                                 |
-| `docker compose up -d` | Local Postgres + Redis                             |
+| Script                                 | What it does                                       |
+| -------------------------------------- | -------------------------------------------------- |
+| `npm run dev`                          | Build shared, then run all three packages in watch |
+| `npm run build`                        | Production build of shared → server → client       |
+| `npm run lint`                         | ESLint across the workspace                        |
+| `npm run format:check`                 | Prettier check (CI) / `npm run format` to fix      |
+| `npm run typecheck`                    | `tsc --noEmit` for server + client                 |
+| `npm run test`                         | Vitest across workspaces                           |
+| `npm run smoke`                        | Playwright single-user smoke test                  |
+| `npm run smoke:sync`                   | Multi-user auth/presence/role/restart test         |
+| `npm run check`                        | Everything CI runs                                 |
+| `npm run migrate -w @syncanvas/server` | Apply the Postgres schema explicitly               |
+| `docker compose up -d`                 | Local Postgres + Redis                             |
+
+CI runs the Postgres integration suite and the multi-user smoke against a
+Postgres service, so the durable path is exercised on every push.
 
 ## Keyboard shortcuts
 
@@ -225,18 +285,18 @@ not running the editor keeps working on its own — the status bar shows
 ## Layout
 
 ```
-shared/   object model, geometry, op types, scene state, protocol, HLC, CRDT (source of truth)
-server/   Node.js gateway: rooms, CRDT merge, WebSocket fan-out
-client/   React + Vite editor: canvas, selection overlay, store, sync client
-scripts/  browser smoke tests (single user and two users)
-docs/     DESIGN.md — data model, protocol, CRDT, scaling, tradeoffs
+shared/   object model, geometry, ops, scene, protocol, HLC, CRDT, HTTP types
+server/   HTTP API, auth, gateway, presence, room registry, store, persistence
+client/   React + Vite editor: canvas, store, sync client, room/access UI
+scripts/  single-user and multi-user browser smoke tests
+docs/     DESIGN.md — architecture, CRDT, schema, presence, tradeoffs
 ```
 
 ## Roadmap
 
-- **Stage 3 (done):** hand-rolled CRDT — HLC, LWW-map, RGA z-order, delete-wins
-  tombstones — plus 10,000-schedule convergence fuzzing and a clock-skew test
-- **Stage 4:** Redis pub/sub sharding, Postgres op log + CRDT snapshots, JWT rooms
-- **Stage 5:** offline outbox, optimistic local apply, per-character text RGA,
-  version restore
-- **Stage 6:** Docker, AWS deploy, CD, architecture README + demo GIF
+- **Stage 4 (done):** guest JWT auth, rooms and share links, server-enforced
+  roles, live cursors/selection, Postgres operation log and snapshots.
+- **Stage 5:** durable IndexedDB outbox, optimistic local apply, per-character
+  text RGA, named versions and restore.
+- **Stage 6:** Redis pub/sub fan-out across gateways, Dockerfiles, AWS deploy,
+  CD, load tests and a public demo.

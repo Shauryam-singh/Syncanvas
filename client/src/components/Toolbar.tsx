@@ -1,4 +1,4 @@
-import { useSceneStore, type Tool } from '../store/sceneStore';
+import { selectCanEdit, useSceneStore, type Tool } from '../store/sceneStore';
 
 interface ToolButton {
   tool: Tool;
@@ -25,6 +25,7 @@ export function Toolbar() {
   const reorderSelection = useSceneStore((state) => state.reorderSelection);
   const selection = useSceneStore((state) => state.selection);
   const spawnObjects = useSceneStore((state) => state.spawnObjects);
+  const canEdit = useSceneStore(selectCanEdit);
 
   const hasSelection = selection.length > 0;
 
@@ -37,6 +38,7 @@ export function Toolbar() {
             type="button"
             className={`tool-button${tool === entry.tool ? ' is-active' : ''}`}
             onClick={() => setTool(entry.tool)}
+            disabled={!canEdit && entry.tool !== 'select'}
             title={`${entry.label} (${entry.shortcut})`}
           >
             {entry.label}
@@ -49,7 +51,7 @@ export function Toolbar() {
           type="button"
           className="tool-button"
           onClick={undo}
-          disabled={undoStack.length === 0}
+          disabled={!canEdit || undoStack.length === 0}
           title="Undo (Ctrl+Z)"
         >
           Undo
@@ -58,7 +60,7 @@ export function Toolbar() {
           type="button"
           className="tool-button"
           onClick={redo}
-          disabled={redoStack.length === 0}
+          disabled={!canEdit || redoStack.length === 0}
           title="Redo (Ctrl+Shift+Z)"
         >
           Redo
@@ -67,7 +69,7 @@ export function Toolbar() {
           type="button"
           className="tool-button"
           onClick={deleteSelected}
-          disabled={!hasSelection}
+          disabled={!canEdit || !hasSelection}
           title="Delete (Del)"
         >
           Delete
@@ -79,7 +81,7 @@ export function Toolbar() {
           type="button"
           className="tool-button"
           onClick={() => reorderSelection('front')}
-          disabled={!hasSelection}
+          disabled={!canEdit || !hasSelection}
           title="Bring to front"
         >
           Front
@@ -88,7 +90,7 @@ export function Toolbar() {
           type="button"
           className="tool-button"
           onClick={() => reorderSelection('forward')}
-          disabled={!hasSelection}
+          disabled={!canEdit || !hasSelection}
           title="Bring forward"
         >
           Forward
@@ -97,7 +99,7 @@ export function Toolbar() {
           type="button"
           className="tool-button"
           onClick={() => reorderSelection('backward')}
-          disabled={!hasSelection}
+          disabled={!canEdit || !hasSelection}
           title="Send backward"
         >
           Backward
@@ -106,7 +108,7 @@ export function Toolbar() {
           type="button"
           className="tool-button"
           onClick={() => reorderSelection('back')}
-          disabled={!hasSelection}
+          disabled={!canEdit || !hasSelection}
           title="Send to back"
         >
           Back
@@ -118,6 +120,7 @@ export function Toolbar() {
           type="button"
           className="tool-button"
           onClick={() => spawnObjects(500)}
+          disabled={!canEdit}
           title="Add 500 objects — performance check"
         >
           +500

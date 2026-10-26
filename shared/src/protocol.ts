@@ -4,6 +4,13 @@ import type { Op, OpEnvelope } from './operations.js';
 export type RoomRole = 'owner' | 'editor' | 'viewer';
 
 export interface PeerPresence {
+  /**
+   * The connection this presence belongs to.
+   *
+   * A user may have several tabs open in the same room; the session id keeps
+   * their cursors (and their removal on disconnect) independent.
+   */
+  sessionId: string;
   userId: string;
   displayName: string;
   color: string;
@@ -13,8 +20,13 @@ export interface PeerPresence {
 }
 
 export type ClientMessage =
+  /** Authenticates the socket with a signed access token. */
   | { t: 'auth'; token: string; displayName?: string }
-  | { t: 'join'; roomId: string }
+  /**
+   * Joins a room. `invite` is a signed share-link token; it is only needed
+   * when the user has no membership yet.
+   */
+  | { t: 'join'; roomId: string; invite?: string }
   | { t: 'leave'; roomId: string }
   /** Batch of local edits. Server acks with the same op ids once persisted. */
   | { t: 'ops'; roomId: string; ops: OpEnvelope[] }
@@ -25,10 +37,11 @@ export type ClientMessage =
   | { t: 'ping' };
 
 export type ServerMessage =
-  | { t: 'welcome'; userId: string; displayName: string; color: string }
+  | { t: 'welcome'; userId: string; sessionId: string; displayName: string; color: string }
   | {
       t: 'joined';
       roomId: string;
+      name: string;
       role: RoomRole;
       snapshotSeq: number;
       peers: PeerPresence[];
@@ -39,7 +52,15 @@ export type ServerMessage =
   | { t: 'ops'; roomId: string; seq: number; ops: OpEnvelope[] }
   | { t: 'ack'; roomId: string; opIds: string[]; seq: number }
   | { t: 'presence'; roomId: string; peers: PeerPresence[] }
-  | { t: 'error'; code: ErrorCode; message: string }
+  | {
+      t: 'error';
+      code: ErrorCode;
+      message: string;
+      /** Present when the error refers to a specific room. */
+      roomId?: string;
+      /** Operation ids that were rejected, so the author can drop them. */
+      opIds?: string[];
+    }
   | { t: 'pong' };
 
 export type ErrorCode =
@@ -137,7 +158,8 @@ function isOpEnvelope(value: unknown): value is OpEnvelope {
 
 function isPeerPresence(value: unknown): value is PeerPresence {
   if (!isRecord(value)) return false;
-  if (typeof value.userId !== 'string' || typeof value.displayName !== 'string') return false;
+  if (typeof value.sessionId !== 'string' || typeof value.userId !== 'string') return false;
+  if (typeof value.displayName !== 'string') return false;
   if (typeof value.color !== 'string') return false;
   if (value.cursor !== null && !isPoint(value.cursor)) return false;
   const selection = asArray(value.selection);
@@ -155,6 +177,10 @@ export function isClientMessage(value: unknown): value is ClientMessage {
         (value.displayName === undefined || typeof value.displayName === 'string')
       );
     case 'join':
+      return (
+        typeof value.roomId === 'string' &&
+        (value.invite === undefined || typeof value.invite === 'string')
+      );
     case 'leave':
       return typeof value.roomId === 'string';
     case 'ops': {
@@ -188,11 +214,13 @@ export function isServerMessage(value: unknown): value is ServerMessage {
     case 'welcome':
       return (
         typeof value.userId === 'string' &&
+        typeof value.sessionId === 'string' &&
         typeof value.displayName === 'string' &&
         typeof value.color === 'string'
       );
     case 'joined': {
       if (typeof value.roomId !== 'string') return false;
+      if (typeof value.name !== 'string') return false;
       if (value.role !== 'owner' && value.role !== 'editor' && value.role !== 'viewer') {
         return false;
       }
@@ -226,7 +254,13 @@ export function isServerMessage(value: unknown): value is ServerMessage {
       return peers !== undefined && peers.every(isPeerPresence);
     }
     case 'error':
-      return typeof value.code === 'string' && typeof value.message === 'string';
+      return (
+        typeof value.code === 'string' &&
+        typeof value.message === 'string' &&
+        (value.roomId === undefined || typeof value.roomId === 'string') &&
+        (value.opIds === undefined ||
+          (Array.isArray(value.opIds) && value.opIds.every((id) => typeof id === 'string')))
+      );
     case 'pong':
       return true;
     default:

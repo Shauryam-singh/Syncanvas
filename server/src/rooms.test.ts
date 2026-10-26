@@ -6,14 +6,18 @@ function envelope(id: string, op: Op, actorId = 'user_1', wall = 1): OpEnvelope 
   return { id, actorId, hlc: { wall, counter: 0, actorId }, op };
 }
 
-function member(clientId: string): RoomMember {
+function member(sessionId: string, overrides: Partial<RoomMember> = {}): RoomMember {
   return {
-    clientId,
-    displayName: clientId,
+    sessionId,
+    userId: sessionId,
+    role: 'editor',
+    displayName: sessionId,
     color: '#6366f1',
     cursor: null,
     selection: [],
     joinedAt: 0,
+    lastSeen: 0,
+    ...overrides,
   };
 }
 
@@ -134,6 +138,38 @@ describe('the room registry', () => {
     expect(registry.leaveAll('user_1')).toEqual(['a', 'b']);
     expect(registry.peers('a')).toEqual([]);
     expect(registry.peers('b')).toEqual([]);
+  });
+
+  it('tracks roles per session, not per user', () => {
+    const registry = new RoomRegistry();
+    registry.join('demo', member('sess_a', { userId: 'user_1', role: 'owner' }));
+    registry.join('demo', member('sess_b', { userId: 'user_1', role: 'viewer' }));
+    expect(registry.roleOf('demo', 'sess_a')).toBe('owner');
+    expect(registry.roleOf('demo', 'sess_b')).toBe('viewer');
+    expect(registry.roleOf('demo', 'sess_missing')).toBeNull();
+  });
+
+  it('drops presence only after the heartbeat TTL', () => {
+    const registry = new RoomRegistry();
+    registry.join('demo', member('sess_a', { lastSeen: 6_000 }));
+    registry.join('demo', member('sess_b', { lastSeen: 9_500 }));
+
+    expect(registry.sweep(10_000, 5_000)).toEqual([]);
+    expect(registry.peers('demo')).toHaveLength(2);
+
+    // sess_a has now been silent for 5.5s; sess_b is still inside the TTL.
+    expect(registry.sweep(11_500, 5_000)).toEqual(['demo']);
+    expect(registry.peers('demo').map((peer) => peer.sessionId)).toEqual(['sess_b']);
+  });
+
+  it('refreshes the cursor and last seen timestamp', () => {
+    const registry = new RoomRegistry();
+    registry.join('demo', member('sess_a', { lastSeen: 0 }));
+    registry.updatePresence('demo', 'sess_a', { x: 12, y: 34 }, ['demo-rect'], 7_000);
+    const [peer] = registry.peers('demo');
+    expect(peer?.cursor).toEqual({ x: 12, y: 34 });
+    expect(peer?.selection).toEqual(['demo-rect']);
+    expect(peer?.lastSeen).toBe(7_000);
   });
 
   it('creates an object on top of the stack', () => {

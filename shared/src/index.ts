@@ -1,6 +1,7 @@
 export * from './object.js';
 export * from './operations.js';
 export * from './protocol.js';
+export * from './api.js';
 export * from './geometry.js';
 export * from './scene.js';
 export * from './hlc.js';

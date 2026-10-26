@@ -11,6 +11,21 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: syncanvas
+          POSTGRES_PASSWORD: syncanvas
+          POSTGRES_DB: syncanvas_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U syncanvas -d syncanvas_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -34,6 +49,9 @@ jobs:
         run: npm run typecheck
 
       - name: Test
+        env:
+          # Runs the Postgres integration tests as well as the in-memory suites.
+          TEST_DATABASE_URL: postgres://syncanvas:syncanvas@localhost:5432/syncanvas_test
         run: npm run test
 
       - name: Build
@@ -76,6 +94,21 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: syncanvas
+          POSTGRES_PASSWORD: syncanvas
+          POSTGRES_DB: syncanvas
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U syncanvas -d syncanvas"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -95,9 +128,15 @@ jobs:
           npm run build -w @syncanvas/client
           npm run build -w @syncanvas/server
 
-      - name: Run the two-browser sync test
+      - name: Run the multi-user sync test
         env:
           SMOKE_CHANNEL: chrome
+          # Durable rooms are what the restart phase checks. Without these the
+          # gateway falls back to the memory store and the script explicitly
+          # skips the persistence assertions.
+          STORE: postgres
+          DATABASE_URL: postgres://syncanvas:syncanvas@localhost:5432/syncanvas
+          JWT_SECRET: ci-smoke-secret
         run: |
           # The test starts the gateway itself — it has to be able to restart
           # it to check that the clients reconnect.

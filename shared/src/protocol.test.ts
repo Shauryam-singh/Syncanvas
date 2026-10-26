@@ -84,9 +84,15 @@ describe('client message parsing', () => {
 describe('server message parsing', () => {
   it('accepts a welcome', () => {
     const message = parseServerMessage(
-      '{"t":"welcome","userId":"user_1","displayName":"Ada","color":"#6366f1"}',
+      '{"t":"welcome","userId":"user_1","sessionId":"sess_1","displayName":"Ada","color":"#6366f1"}',
     );
     expect(message?.t).toBe('welcome');
+  });
+
+  it('rejects a welcome without a session id', () => {
+    expect(
+      parseServerMessage('{"t":"welcome","userId":"user_1","displayName":"Ada","color":"#6366f1"}'),
+    ).toBeNull();
   });
 
   it('accepts a state with objects', () => {

@@ -4,6 +4,12 @@ Real-time collaborative scene editor ("Figma-lite") with a hand-rolled CRDT.
 This document is the source of truth for the data model, wire protocol and CRDT
 semantics; it is intended to evolve into the public README as the project ships.
 
+Stage 4 is implemented: guest JWT sessions, rooms and signed invites, enforced
+owner/editor/viewer roles, ephemeral presence, and a Postgres operation log with
+snapshots. The gateway is still a single process; the Redis pub/sub and
+load-balancer path in §2 and §9 is the Stage 6 target, while the auth, presence,
+role and persistence layers described there are real today.
+
 ---
 
 ## 1. Goals and non-goals
@@ -62,17 +68,28 @@ semantics; it is intended to evolve into the public README as the project ships.
    Client (React + Vite): CRDT merge → project → render (optimistic apply is stage 5)
 ```
 
-**Request flow for an edit (stage 3 — what is implemented today)**
+> **Implemented vs target.** Stage 4 runs this stack as a **single gateway**:
+> the auth, room registry, presence, Postgres store and snapshots are live, but
+> the load balancer and Redis fan-out are not wired yet. §9 describes the
+> sharding design; §15 describes what Stage 4 actually ships.
 
+**Request flow for an edit (stage 4 — what is implemented today)**
+
+0. The browser signs in through `POST /api/auth/guest`, connects the WebSocket
+   and sends `auth {token}`. The gateway verifies the HS256 access token, loads
+   the user and replies with a `welcome` that includes a per-connection
+   `sessionId`.
 1. User drags a rect. The client renders a transient _draft_ while the pointer
    moves and turns the finished gesture into one or two operations.
 2. The client stamps the operations with its HLC, puts the envelopes in its
    outbox and sends an `ops` batch over the WebSocket. It does **not** apply
    them locally yet — the author waits for the echo.
-3. The gateway stamps the envelopes with its own identity for the actor,
-   merges the batch into the room's CRDT document (order-independent),
-   assigns the batch the next sequence number as a broadcast watermark, and
-   broadcasts it to the room — the author included.
+3. The gateway checks the room membership/invite and the role. A viewer's batch
+   is rejected with `forbidden` and the rejected operation ids; an editor or
+   owner batch is stamped with the actor identity for the socket, merged into
+   the room's CRDT document (order-independent), assigned the next sequence
+   number as a broadcast watermark, appended to Postgres, and broadcast to the
+   room — the author included.
 4. Every client merges the same envelopes into its own document and projects
    the result. Because the merge is commutative, delivery order does not
    matter; all replicas reach the same scene.
@@ -98,9 +115,11 @@ semantics; it is intended to evolve into the public README as the project ships.
 > operations centrally, which converged but paid a round trip on every edit and
 > could not merge two offline histories. Stage 3 replaced the ordering point
 > with an order-independent merge: conflicts now resolve by version, not by
-> arrival order, and the gateway is a relay rather than an arbiter. What
-> remains for stage 5 is applying locally _before_ the echo, keeping the outbox
-> in IndexedDB, and persisting the log. §13 measures what stage 2 cost.
+> arrival order, and the gateway is a relay rather than an arbiter. Stage 4 added
+> the surrounding product (auth, roles, presence, durable log/snapshots). What
+> remains for stage 5 is applying locally _before_ the echo and keeping the
+> outbox in IndexedDB; Redis fan-out and log compaction belong to stage 6. §13
+> measures what stage 2 cost.
 
 ---
 
@@ -292,31 +311,36 @@ hand-written interfaces on either side.
 
 ### Client → Server
 
-| `t`              | Payload                          | Purpose                                         |
-| ---------------- | -------------------------------- | ----------------------------------------------- |
-| `auth`           | `{token, displayName?}`          | JWT handshake before `join` (stage 4: real JWT) |
-| `join`           | `{roomId}`                       | Subscribe + receive `state`                     |
-| `ops`            | `{roomId, ops: OpEnvelope[]}`    | Batched edits (idempotent by `op.id`)           |
-| `presence`       | `{roomId, cursor, selection}`    | Ephemeral, throttled ~30 Hz                     |
-| `sync`           | `{roomId, snapshotSeq, opIds[]}` | Reconnect catch-up                              |
-| `leave` / `ping` | —                                | Lifecycle / RTT                                 |
+| `t`              | Payload                          | Purpose                                           |
+| ---------------- | -------------------------------- | ------------------------------------------------- |
+| `auth`           | `{token, displayName?}`          | JWT handshake; required within 15 s of connecting |
+| `join`           | `{roomId, invite?}`              | Subscribe + receive `state`; membership or invite |
+| `ops`            | `{roomId, ops: OpEnvelope[]}`    | Batched edits (idempotent by `op.id`)             |
+| `presence`       | `{roomId, cursor, selection}`    | Ephemeral, throttled to 25 Hz by the client       |
+| `sync`           | `{roomId, snapshotSeq, opIds[]}` | Reconnect catch-up                                |
+| `leave` / `ping` | —                                | Lifecycle / heartbeat                             |
 
 ### Server → Client
 
-| `t`        | Payload                               | Purpose                                 |
-| ---------- | ------------------------------------- | --------------------------------------- |
-| `welcome`  | `{userId, displayName, color}`        | Post-auth identity (server-assigned id) |
-| `joined`   | `{roomId, role, snapshotSeq, peers}`  | Room admission                          |
-| `state`    | `{roomId, snapshotSeq, objects, ops}` | Baseline + ops after snapshot           |
-| `ops`      | `{roomId, seq, ops[]}`                | Broadcast of edits — author included    |
-| `ack`      | `{roomId, opIds[], seq}`              | Received (safe to drop from the outbox) |
-| `presence` | `{roomId, peers[]}`                   | Cursor/selection fan-out                |
-| `error`    | `{code, message}`                     | `unauthorized`/`forbidden`/…            |
-| `pong`     | —                                     | Liveness                                |
+| `t`        | Payload                                    | Purpose                                 |
+| ---------- | ------------------------------------------ | --------------------------------------- |
+| `welcome`  | `{userId, sessionId, displayName, color}`  | Post-auth identity (server-assigned id) |
+| `joined`   | `{roomId, name, role, snapshotSeq, peers}` | Room admission and assigned role        |
+| `state`    | `{roomId, snapshotSeq, objects, ops}`      | Baseline + ops after snapshot           |
+| `ops`      | `{roomId, seq, ops[]}`                     | Broadcast of edits — author included    |
+| `ack`      | `{roomId, opIds[], seq}`                   | Received (safe to drop from the outbox) |
+| `presence` | `{roomId, peers[]}`                        | Cursor/selection fan-out                |
+| `error`    | `{code, message, roomId?, opIds?}`         | `unauthorized`/`forbidden`/…            |
+| `pong`     | —                                          | Liveness                                |
 
-The `userId` in `welcome` is assigned by the gateway: a client cannot choose
-its own identity and cannot forge the `actorId` of an envelope — the gateway
-stamps every envelope it accepts with the identity of the socket that sent it.
+The `userId` in `welcome` is assigned by the gateway from the verified access
+token: a client cannot choose its own identity and cannot forge the `actorId` of
+an envelope — the gateway stamps every envelope it accepts with the identity of
+the socket that sent it. The `sessionId` is per connection and is the presence
+key. An invalid or expired token is answered with `unauthorized` and a close
+code of `4001`; the client clears its cached session and shows the access gate
+instead of reconnecting forever. A denied room join is `forbidden` and is also
+terminal for that socket.
 
 ### Op envelope
 
@@ -344,106 +368,168 @@ same envelopes into its own document; the winner of a conflict is
 
 Replayed batches after a reconnect are deduped by `op.id` (the document keeps a
 `seen` set), so a client that re-sends its outbox cannot apply anything twice.
-Catch-up currently starts from a **projected snapshot** rather than the full
-CRDT history; §13 lists what that costs.
+Client catch-up currently starts from a **projected scene** rather than the
+full CRDT history; §13 lists what that costs. (The persisted server snapshot
+is different: it stores the full merge state, so restart recovery is exact.)
 
 ---
 
 ## 6. Persistence model (Postgres)
 
+The implementation lives in `server/src/store/schema.sql` and is applied
+idempotently on startup (or with `npm run migrate -w @syncanvas/server`).
+
 ```sql
-CREATE TABLE rooms (
-  id          uuid PRIMARY KEY,
-  name        text NOT NULL,
-  owner_id    text NOT NULL,
+CREATE TABLE users (
+  id           text PRIMARY KEY,
+  display_name text NOT NULL,
+  created_at   timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE documents (
+  id         text PRIMARY KEY,
+  name       text NOT NULL,
+  owner_id   text NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE memberships (
+  document_id text NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  user_id     text NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  role        text NOT NULL CHECK (role IN ('owner', 'editor', 'viewer')),
   created_at  timestamptz NOT NULL DEFAULT now(),
-  updated_at  timestamptz NOT NULL DEFAULT now()
+  PRIMARY KEY (document_id, user_id)
 );
 
-CREATE TABLE room_members (
-  room_id     uuid NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
-  user_id     text NOT NULL,
-  role        text NOT NULL CHECK (role IN ('owner','editor','viewer')),
-  added_at    timestamptz NOT NULL DEFAULT now(),
-  PRIMARY KEY (room_id, user_id)
-);
-
-CREATE TABLE invite_links (
-  token       text PRIMARY KEY,           -- share-link secret
-  room_id     uuid NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
-  role        text NOT NULL CHECK (role IN ('editor','viewer')),
-  created_by  text NOT NULL,
-  expires_at  timestamptz
-);
-
-CREATE TABLE ops (                          -- the operation log
-  id          bigserial PRIMARY KEY,        -- room-local seq, assigned on append
-  room_id     uuid NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
-  op_key      text NOT NULL,                -- Envelope.id, idempotency
-  actor_id    text NOT NULL,
+-- One row per accepted CRDT operation. `seq` is the broadcast watermark of the
+-- batch it arrived in, not a merge rule; the envelope carries the HLC and op id
+-- that decide conflicts inside the CRDT.
+CREATE TABLE operations (
+  document_id text NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  op_id       text NOT NULL,
+  actor_id    text NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  seq         bigint NOT NULL,
   hlc_wall    bigint NOT NULL,
-  hlc_counter int  NOT NULL,
-  payload     jsonb NOT NULL,               -- OpEnvelope.op
+  hlc_counter integer NOT NULL,
+  envelope    jsonb NOT NULL,
   created_at  timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (room_id, op_key)                  -- replay-safe duplicate drops
+  PRIMARY KEY (document_id, op_id)
 );
 
-CREATE INDEX ops_room_id_idx ON ops (room_id, id);
+CREATE INDEX operations_document_seq_idx
+  ON operations (document_id, seq, op_id);
 
+-- Full CRDT document at a known watermark (registers, tombstones, RGA order
+-- and seen ids). Loading takes the newest snapshot and replays only the
+-- operations after it; the projected scene alone would not be replay-safe.
 CREATE TABLE snapshots (
   id          bigserial PRIMARY KEY,
-  room_id     uuid NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
-  last_op_id  bigint NOT NULL,              -- ops.id watermark covered
-  state       jsonb NOT NULL,               -- materialised scene
-  created_by  text,
+  document_id text NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  seq         bigint NOT NULL,
+  state       jsonb NOT NULL,
   created_at  timestamptz NOT NULL DEFAULT now()
 );
+
+CREATE INDEX snapshots_document_seq_idx
+  ON snapshots (document_id, seq DESC, id DESC);
 ```
 
-**Read path:** `state = latest snapshot (last_op_id = M) + ops WHERE id > M`,
-applied in any order thanks to the merge invariant.
+**Store selection:** `STORE=auto` probes `DATABASE_URL` and uses Postgres when
+reachable, otherwise the memory store; `postgres` and `memory` force a mode.
+`/healthz` reports the active kind. The memory store deliberately keeps the same
+`Store` interface, so the gateway, HTTP API and tests are identical in both
+modes.
 
-**Compaction:** after a snapshot is written, `DELETE FROM ops WHERE room_id = ?
-AND id <= last_op_id` (batched, in a transaction with the snapshot insert).
-Op rows referenced by _retained history versions_ are preserved by keeping the
-watermark of the oldest named version.
+**Write path:** accepted batches are appended through a per-room serial queue.
+Writes are fire-and-forget for the socket path; shutdown awaits `flush()` so a
+restart does not lose the last edits. The `(document_id, op_id)` primary key is
+the replay/dedupe guard.
+
+**Read path:** `doc = deserializeDoc(newest snapshot at seq M) + operations
+WHERE seq > M`, merged in any order thanks to the CRDT invariant. The snapshot
+carries the full merge state, so a late or replayed operation is rejected by
+the same stamps and `seen` set as on the live replica. With no snapshot (or an
+unreadable one) the full log is replayed over the deterministic seed scene.
+
+**Invites are not stored.** A share link is an HS256 token carrying
+`{room, role, owner, exp}`; redeeming it calls `grant()` and persists a normal
+membership. There is therefore no invite table to clean up, and a link can be
+revoked only by rotating `JWT_SECRET` or by removing the resulting membership.
+That is a deliberate Stage 4 tradeoff; per-link revocation belongs with the
+durable history work in Stage 5.
 
 ---
 
 ## 7. Snapshots and version history
 
-- Trigger: every **1 000 ops** or **5 minutes** of activity per room.
-- Single-writer: a Redis `SET NX PX` lock (`lock:snapshot:{roomId}`, 10 s TTL)
-  ensures only one gateway snapshots a room; others skip.
-- Writer folds `snapshot + ops` through the same `mergeEnvelopes` (and the same
-  projection) used by the gateway and the clients — the snapshot cannot drift
-  from live state because there is one merge implementation.
-- Named versions = snapshots with `created_by` set; restore per §4.7.
+**Implemented (stage 4):**
+
+- Trigger: every **100 ops** or **60 s** of activity per room.
+- A snapshot stores the **whole CRDT document** (`serializeDoc`): every
+  register version, tombstone, RGA order entry and the `seen` id set. Storing
+  only the projected scene would lose the metadata that makes late replays
+  safe — a stale create could resurrect a deleted object and an old write could
+  overwrite a newer value after a restart. `deserializeDoc` rebuilds the merge
+  state exactly.
+- The snapshot is written behind the room's serial write queue, tagged with the
+  room's sequence watermark. Writing is fire-and-forget on the socket path;
+  shutdown awaits `flush()`.
+- Loading a room takes the newest snapshot and replays only operations with a
+  higher `seq`. If the snapshot is missing or unreadable, the gateway falls back
+  to the seed scene plus the full log. The merge is order-independent, so replay
+  order is irrelevant.
+- Snapshots are **internal checkpoints**, not user-visible versions.
+
+**Not implemented yet:**
+
+- Compaction. Operation rows below the newest snapshot are still retained, and
+  the snapshot's `seen` set grows with them, so the log is monotonic. Deleting
+  covered rows needs a watermark plus a rule for which `seen` ids must survive
+  for late-ack replays and future named versions.
+- Named versions, restore and history browsing.
+- Multi-gateway single-writer election. Today's single gateway is the only
+  writer; the Redis `SET NX PX` lock described in §9 belongs with fan-out.
 
 ---
 
 ## 8. Presence, offline and reconnect
 
-**Presence** — ephemeral Redis hash per room (`presence:{roomId}`,
-field = userId, `HSET`/`EXPIRE 30s`), gossiped over the same pub/sub channel
-at ~15 Hz per client (throttled, interpolated client-side). Never touches
-Postgres.
+**Presence** is ephemeral and lives only in the gateway's room registry. It is
+keyed by the per-connection `sessionId`, not `userId`, so two tabs with the
+same account do not overwrite each other.
 
-**Offline** — the client persists every local op envelope in an IndexedDB
-outbox _before_ rendering from it:
+- The client sends at most one presence message per 40 ms (25 Hz, trailing
+  edge) and a heartbeat every 20 s. The server forwards a peer's presence at
+  most every 15 ms and clamps cursor coordinates to ±100 000 with selection
+  capped at 1 000 ids.
+- The client interpolates the last received cursor towards its target on
+  `requestAnimationFrame`; the network rate stays low while motion looks smooth.
+- The server sweeps sessions unseen for 60 s every 5 s, and removes a session
+  immediately when its socket closes. A closed tab therefore disappears without
+  waiting for the TTL.
+- Presence never touches Postgres and is not replayed after reconnecting.
 
-1. Reconnect → `sync` with `{snapshotSeq, opIds}` → server replies `state`
-   with only the delta, plus `ack`s for outbox entries already persisted.
-2. Unacked envelopes are re-sent; server dedupes on `UNIQUE (room_id, op_key)`.
-3. Because merges are order-independent and HLC-stamped, offline edits land as
-   if they had been made concurrently with everything else.
+**Offline / reconnect** in stage 4:
 
-Success metric: outbox entries eventually acked / total (target: 100 % in fuzz
-tests that randomly partition clients).
+1. Edits made while the socket is down stay in the client's **in-memory**
+   outbox. The store still applies them locally only after the echo, so an
+   offline edit is visible in the editor but pending until reconnect.
+2. Reconnect sends `sync {snapshotSeq, opIds}`; the gateway replies with the
+   current projection and acknowledges ids it already has.
+3. Unacknowledged envelopes are re-sent and deduped by `(documentId, opId)` in
+   the CRDT and by the Postgres `(document_id, op_id)` primary key.
+4. A page reload discards the outbox. IndexedDB persistence and local-first
+   optimistic apply are stage 5.
+
+The eventual success metric remains outbox entries acked / total (target: 100 %
+under randomized partitioning in the stage 5 fuzz tests).
 
 ---
 
-## 9. Scaling gateways
+## 9. Scaling gateways (target)
+
+> Stage 4 runs **one** gateway process. The following is the design for
+> horizontal scale; it is not wired yet.
 
 - Rooms are sharded onto gateways by `hash(roomId) % N` (consistent hashing);
   the LB only needs L4/round-robin for connections, room affinity comes from
@@ -452,33 +538,44 @@ tests that randomly partition clients).
 - Cross-instance fan-out: every gateway `SUBSCRIBE`s to the rooms hosted locally
   and publishes batched ops to `room:{roomId}` on Redis. One Redis, one channel
   per room.
+- A Redis `SET NX PX` lock (`lock:snapshot:{roomId}`, 10 s TTL) elects the
+  snapshot writer per room.
 - Backpressure: per-socket send queues with high-water mark; slow consumers get
   `sync`-style resumable catch-up instead of unbounded buffering.
 - Metrics (Prometheus): connections/instance, ops/s, `p50/p95 sync latency`
   (client timestamp → `ack`), queue depth, Redis round-trip.
-- Load test (k6, CI stage 4): ramp to 200 virtual users per room, assert
-  p95 ack latency < 80 ms and zero convergence mismatches at the end.
+- Load test (k6, stage 6): ramp to 200 virtual users per room, assert p95 ack
+  latency < 80 ms and zero convergence mismatches at the end.
 
 ---
 
 ## 10. Design decisions and tradeoffs
 
-| Decision                                       | Why                                                                            | Cost                                                                             |
-| ---------------------------------------------- | ------------------------------------------------------------------------------ | -------------------------------------------------------------------------------- |
-| Hand-rolled LWW-map + RGA + HLC instead of Yjs | Proves CRDT knowledge; ~300 LOC core; fully fuzz-testable; no black box        | No free sub-transaction text merging; we own the tombstone/compaction edge cases |
-| Per-property LWW registers                     | Concurrent edits to different properties never conflict                        | Same-property concurrent edits lose one value (accepted for canvas props)        |
-| LWW over OT/transform functions                | Order-independent merge is trivially correct and testable                      | "Latest wins" can silently discard intent for the _same_ property                |
-| HLC over pure Lamport                          | Close to wall time → intuitive conflicts; no trusted clock needed              | Absorbs a peer's future wall clock on receipt (no clamping — §4.1)               |
-| Undo = new inverse ops                         | Reuses the merge path; works offline and across users                          | Undo is itself an edit (LWW, not isolation-preserving)                           |
-| JSON wire format first                         | Debuggable, types shared directly                                              | ~1.5× bytes vs MessagePack; revisit after load tests                             |
-| Op log + snapshots in Postgres                 | One transactional store; version restore falls out naturally                   | Log growth requires disciplined compaction                                       |
-| Redis pub/sub (not Streams)                    | Ops are replayable from Postgres — Redis is transport, not source of truth     | No Redis-side durability needed (and none claimed)                               |
-| Delete-wins existence rule                     | No late `setProp` can resurrect a deleted object; ties are deterministic       | A create tied exactly with a delete loses; undo must be strictly later           |
-| Operation id as the final tie-break            | Even identical HLCs resolve the same way on every replica                      | Version compare is a 4-tuple, not just an HLC compare                            |
-| Explicit top/bottom origins for z-order        | Creation appends, "send to back" prepends — both have a meaning                | One extra field in every order entry                                             |
-| Gateway merges but no longer orders            | Server and clients run the same code path, so they cannot disagree             | The gateway must hold a replica of every room it serves                          |
-| No optimistic apply (stage 3)                  | The scene is always a prefix of the replicated document — easy to reason about | Every keystroke waits for the round trip; feels laggy on a bad link (stage 5)    |
-| Broadcast to the author as well                | The author merges the same envelopes as everybody else                         | The author cannot render before the server answers                               |
+| Decision                                        | Why                                                                            | Cost                                                                                   |
+| ----------------------------------------------- | ------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------- |
+| Hand-rolled LWW-map + RGA + HLC instead of Yjs  | Proves CRDT knowledge; ~300 LOC core; fully fuzz-testable; no black box        | No free sub-transaction text merging; we own the tombstone/compaction edge cases       |
+| Per-property LWW registers                      | Concurrent edits to different properties never conflict                        | Same-property concurrent edits lose one value (accepted for canvas props)              |
+| LWW over OT/transform functions                 | Order-independent merge is trivially correct and testable                      | "Latest wins" can silently discard intent for the _same_ property                      |
+| HLC over pure Lamport                           | Close to wall time → intuitive conflicts; no trusted clock needed              | Absorbs a peer's future wall clock on receipt (no clamping — §4.1)                     |
+| Undo = new inverse ops                          | Reuses the merge path; works offline and across users                          | Undo is itself an edit (LWW, not isolation-preserving)                                 |
+| JSON wire format first                          | Debuggable, types shared directly                                              | ~1.5× bytes vs MessagePack; revisit after load tests                                   |
+| Op log + snapshots in Postgres                  | One transactional store; replay over the snapshot is order-independent         | Log growth requires disciplined compaction (not implemented yet)                       |
+| Redis pub/sub (not Streams)                     | Ops are replayable from Postgres — Redis is transport, not source of truth     | No Redis-side durability needed (and none claimed); not wired in stage 4               |
+| Guest-only auth (no passwords)                  | No email/verification scope, instant onboarding, no credential database        | Identity is device-scoped; clearing storage loses memberships without a link           |
+| Dependency-free HS256 JWT                       | Tiny, auditable, one shared secret for access tokens and invites               | Secret rotation invalidates every session and link; no key ids/OIDC                    |
+| Invite as a signed bearer capability            | No invite table, no cleanup, links work after an ephemeral-store restart       | Cannot revoke one link; only rotating the secret or removing the membership            |
+| Roles enforced in the gateway, mirrored in UI   | A viewer cannot edit even with a modified client; UX still explains read-only  | Two places to keep in sync; the server remains the source of truth                     |
+| Presence in memory keyed by connection          | Multi-tab safe, zero DB writes, disappears immediately on close                | Not shared across future gateways; lost on restart (acceptable for presence)           |
+| Presence throttled 25 Hz + client interpolation | Cuts traffic ~40× versus pointer-move rate while looking smooth                | A receiver sees a slightly delayed final position                                      |
+| Snapshot every 100 ops / 60 s                   | Bounds replay on load without snapshotting every batch                         | Up to 100 operations replay; snapshots accumulate until compaction exists              |
+| `STORE=auto` fallback to memory                 | Clone-and-run works without Docker/Postgres                                    | A misconfigured production gateway can silently start ephemeral; `/healthz` reports it |
+| In-memory outbox (stage 4)                      | Reconnect replays unacked edits across a socket drop                           | A page reload loses them; IndexedDB is stage 5                                         |
+| Delete-wins existence rule                      | No late `setProp` can resurrect a deleted object; ties are deterministic       | A create tied exactly with a delete loses; undo must be strictly later                 |
+| Operation id as the final tie-break             | Even identical HLCs resolve the same way on every replica                      | Version compare is a 4-tuple, not just an HLC compare                                  |
+| Explicit top/bottom origins for z-order         | Creation appends, "send to back" prepends — both have a meaning                | One extra field in every order entry                                                   |
+| Gateway merges but no longer orders             | Server and clients run the same code path, so they cannot disagree             | The gateway must hold a replica of every room it serves                                |
+| No optimistic apply (stage 3/4)                 | The scene is always a prefix of the replicated document — easy to reason about | Every keystroke waits for the round trip; feels laggy on a bad link (stage 5)          |
+| Broadcast to the author as well                 | The author merges the same envelopes as everybody else                         | The author cannot render before the server answers                                     |
 
 ---
 
@@ -489,43 +586,48 @@ syncanvas/
 ├── client/                  # React + Vite + TS editor
 │   ├── src/
 │   │   ├── App.tsx          # Editor shell
-│   │   ├── canvas/          # SVG canvas, selection overlay, viewport maths
-│   │   ├── components/      # Toolbar, properties panel, status bar
+│   │   ├── canvas/          # SVG canvas, selection overlay, peer layer, viewport maths
+│   │   ├── components/      # Toolbar, properties panel, status bar, RoomPanel, AccessGate
 │   │   ├── hooks/           # Keyboard shortcuts
-│   │   ├── net/             # SyncClient + the useSync hook (stage 2) ✅
-│   │   ├── store/           # Zustand store (operations, undo/redo, draft)
+│   │   ├── net/             # SyncClient, useSync, HTTP API, cached session
+│   │   ├── store/           # Zustand store (doc, projection, undo, role gates)
 │   │   └── main.tsx
 │   ├── vite.config.ts
 │   └── tsconfig*.json
-├── server/                  # Node.js gateway
+├── server/                  # Node.js HTTP API + WebSocket gateway
 │   ├── src/
-│   │   ├── index.ts         # HTTP + health + WebSocket upgrade (stage 2) ✅
-│   │   ├── gateway.ts       # Protocol handling, broadcast, server ids (stage 2) ✅
-│   │   ├── rooms.ts         # Room registry, CRDT merge (stage 3) ✅
+│   │   ├── index.ts         # HTTP + WebSocket upgrade + graceful flush
+│   │   ├── http.ts          # Guest auth, rooms, invites, CORS, /healthz
+│   │   ├── gateway.ts       # Socket auth, access control, presence, ops
+│   │   ├── auth/jwt.ts      # Dependency-free HS256 access + invite tokens
+│   │   ├── rooms.ts         # Room registry, roles, presence TTL, CRDT replica
+│   │   ├── persistence.ts   # Load, append, snapshot every 100 ops / 60 s, flush
+│   │   ├── store/           # Store interface, memory + Postgres, schema.sql
 │   │   └── config.ts
 │   └── tsconfig.json
 ├── shared/                  # Single source of truth for types + CRDT
 │   ├── src/
 │   │   ├── index.ts
-│   │   ├── object.ts        # Object model (stage 0) ✅
-│   │   ├── operations.ts    # Op types + HLC (stage 0) ✅
-│   │   ├── protocol.ts      # WS message types + runtime validators (stage 2) ✅
-│   │   ├── geometry.ts      # Transform maths (stage 1) ✅
-│   │   ├── scene.ts         # Scene state + applyOp (stage 1) ✅
-│   │   ├── hlc.ts           # Hybrid logical clock (stage 2) ✅
-│   │   ├── initialScene.ts  # Room seed scene (stage 2) ✅
-│   │   └── crdt/            # LWW-map, RGA, merge + fuzz tests (stage 3) ✅
+│   │   ├── api.ts           # HTTP request/response types
+│   │   ├── object.ts        # Object model
+│   │   ├── operations.ts    # Op types
+│   │   ├── protocol.ts      # WS messages + runtime validators
+│   │   ├── geometry.ts      # Transform maths
+│   │   ├── scene.ts         # Scene state + projection
+│   │   ├── hlc.ts           # Hybrid logical clock
+│   │   ├── initialScene.ts  # Room seed scene
+│   │   └── crdt/            # LWW-map, RGA, merge + fuzz tests
 │   └── tsconfig.json
 ├── scripts/
 │   ├── browser.mjs          # Chromium resolution shared by the smoke tests
-│   ├── smoke.mjs            # Playwright smoke test (stage 1) ✅
-│   └── sync-smoke.mjs       # Two-browser sync test (stage 2) ✅
+│   ├── smoke.mjs            # Single-user Playwright smoke test
+│   └── sync-smoke.mjs       # Multi-user auth/presence/role/restart smoke test
 ├── docs/
 │   └── DESIGN.md            # This document
 ├── docker-compose.yml       # Postgres 16 + Redis 7
 ├── eslint.config.mjs
 ├── tsconfig.base.json
-└── .github/workflows/ci.yml # lint + format + typecheck + test + build + smoke + sync
+└── .github/workflows/ci.yml # lint/format/typecheck/test/build + Postgres + smoke + sync
 ```
 
 **Stage 0 acceptance:** `docker compose up` healthy on a clean machine, CI
@@ -630,8 +732,9 @@ in what order operations are broadcast.**
 - `op.id` is the idempotency key. A batch that contains an operation the room
   has already seen is not applied twice; the author is sent the full state
   instead, because a duplicate means it missed a broadcast.
-- The rooms live in memory for now. The document's `seen` set is the replay
-  guard that moves into Postgres as `UNIQUE (room_id, op_key)` in stage 4.
+- The rooms lived in memory at stage 2. The document's `seen` set is the replay
+  guard that stage 4 made durable as the `(document_id, op_id)` primary key in
+  Postgres.
 
 ### 13.2 The client (`client/src/net/syncClient.ts`)
 
@@ -657,12 +760,12 @@ The stage-2 merge was `applyOps` in arrival order — the last write to a
 property won. That was convergent (every replica ended with the same scene) but
 not conflict-free:
 
-| Situation                                     | Stage 2 behaviour                                        | Stage 3                              |
-| --------------------------------------------- | -------------------------------------------------------- | ------------------------------------ |
-| Two users drag the same rect at the same time | One drag is lost; the winner depends on arrival order    | Later version wins on every replica  |
-| Two users set different properties            | No conflict — the properties are independent             | Unchanged                            |
-| Two users create an object at the same time   | Both survive, but their z-order depends on arrival order | RGA orders them deterministically    |
-| A client is offline for a minute              | Its edits are lost: they never reach the gateway         | Still lost — stage 5 adds the outbox |
+| Situation                                     | Stage 2 behaviour                                        | Stage 3                                                                                  |
+| --------------------------------------------- | -------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| Two users drag the same rect at the same time | One drag is lost; the winner depends on arrival order    | Later version wins on every replica                                                      |
+| Two users set different properties            | No conflict — the properties are independent             | Unchanged                                                                                |
+| Two users create an object at the same time   | Both survive, but their z-order depends on arrival order | RGA orders them deterministically                                                        |
+| A client is offline for a minute              | Its edits are lost: they never reach the gateway         | Replayed from the in-memory outbox on reconnect (stage 4); reload-safe outbox in stage 5 |
 
 ### 13.4 How stage 2 is tested
 
@@ -723,8 +826,8 @@ cannot disagree about the merge rule.
   stack and the outbox need to agree on what "already applied" means first.
 - **Full-state sync.** A joining client receives the projected scene, not the
   tombstones and register versions. That is sufficient for the operations it
-  receives afterwards, but a full CRDT snapshot belongs with the persisted log
-  in stage 4.
+  receives afterwards, but tombstone-aware client bootstrap is a later
+  refinement (the server-side persisted snapshot already exists in stage 4).
 - **Tombstone compaction.** Deleted objects are kept forever; safe, but the
   document grows. Compaction needs a watermark past all in-flight replicas.
 - **Per-character text.** §4.4.
@@ -740,7 +843,7 @@ cannot disagree about the merge rule.
 | `shared/src/crdt/convergence.test.ts` | Oracle: every register holds the maximum-version write, computed independently of the merge                                                       |
 | `shared/src/crdt/convergence.test.ts` | Clock skew: a client 10 minutes ahead wins its first edit, then loses to clients that observed it; delivery order does not change the final state |
 | `server/src/rooms.test.ts`            | The gateway keeps the newest write even when it arrives first, and a late edit cannot resurrect a deleted object                                  |
-| `scripts/sync-smoke.mjs`              | Two real browsers still converge, undo still travels, and both survive a gateway restart                                                          |
+| `scripts/sync-smoke.mjs`              | Real browsers converge, undo travels, roles work, presence is ephemeral, and the durable scene survives a restart                                 |
 
 The stage 3 checklist:
 
@@ -757,14 +860,167 @@ The stage 3 checklist:
 
 ---
 
-## 15. Roadmap
+## 15. Stage 4 — rooms, auth, presence and durability
 
-| Stage    | Milestone                                                           | Exit criterion                         |
-| -------- | ------------------------------------------------------------------- | -------------------------------------- |
-| 0        | Monorepo, compose, CI, design doc, shared types                     | CI green; compose healthy              |
-| 1        | Canvas, transform maths, operation pipeline, undo/redo              | 500 objects at 60 fps; ops only        |
-| 2        | WS gateway, naive LWW sync                                          | Two browsers move a rect live          |
-| 3 (done) | HLC, LWW-map, RGA z-order, tombstones, convergence fuzz tests       | 10 000 randomized schedules converge   |
-| 4        | Redis pub/sub sharding, Postgres op log + CRDT snapshots, JWT rooms | 2 gateways in sync; restart-safe       |
-| 5        | Offline outbox, optimistic apply, text RGA, version restore, k6     | p95 < 80 ms @ 200 users; 0 lost writes |
-| 6        | Dockerfiles, AWS deploy, GitHub Actions CD, README + demo GIF       | Live URL + demo video                  |
+Stage 4 turns the CRDT demo into a product: an authenticated room with a role
+model, live people in it, and a scene that survives a restart.
+
+### 15.1 Authentication
+
+`POST /api/auth/guest` creates a user row and returns:
+
+```json
+{
+  "token": "header.payload.signature",
+  "user": { "id": "usr_…", "displayName": "Ada" },
+  "expiresAt": 1760000000000
+}
+```
+
+The token is HS256, implemented in `server/src/auth/jwt.ts` without a JWT
+dependency. It has a constant header, a mandatory `exp`, a constant-time
+signature comparison, and an injected clock for tests. The WebSocket sends
+`auth {token}`; the gateway verifies the signature, loads the user row and
+replies `welcome {userId, sessionId, displayName, color}`. A socket that has not
+authenticated within 15 s is closed. Invalid/expired tokens get `unauthorized`
+and close code `4001`; the client treats that as terminal and shows the access
+gate rather than reconnecting in a loop. The same secret signs invite tokens,
+but their `typ` claim (`access` vs `invite`) keeps them from being confused.
+
+The browser caches `{token, user, expiresAt, server}` in `localStorage`. The
+token is held outside Zustand and only attached on demand. The cache is scoped
+to the gateway that issued it (tokens do not travel), and an expired cache is
+replaced by a fresh guest. There is deliberately no password flow; see the
+tradeoff table.
+
+### 15.2 Rooms, membership and invites
+
+- `POST /api/rooms` creates a `documents` row and an `owner` membership.
+- `POST /api/rooms/:id/invites` mints a signed invite for `editor` or `viewer`.
+  Any owner or editor may mint; a viewer gets `403`.
+- `GET /api/rooms` lists the caller's memberships; `GET /api/rooms/:id` returns
+  a room the caller can read.
+- `authorizeJoin` checks membership first. If there is none, a valid signed
+  invite for that exact room is redeemed and persisted as a membership, so a
+  refresh does not need the invite again.
+- A valid invite for a missing room may recreate the document. This is what
+  keeps share links working after a memory-store restart. The invite's owner is
+  reused if that user still exists, otherwise the joining user owns the new
+  room.
+- The `demo` room is intentionally public to any signed-in user, and can be
+  disabled with `PUBLIC_DEMO_ROOM=`. It is the zero-friction sandbox; all other
+  rooms require membership or an invite.
+- The client also gates the UI (`viewer` and `checking` cannot edit) and the
+  store refuses edit actions, but the server is authoritative: a viewer `ops`
+  batch is rejected with `forbidden` plus the rejected `opIds`, and the batch is
+  never merged or persisted.
+
+### 15.3 Presence
+
+The per-connection `sessionId` from `welcome` is the presence key. The registry
+holds `{sessionId, userId, displayName, color, cursor, selection, joinedAt,
+lastSeen}` per room. A `presence` message updates it, is clamped and rate
+limited per socket, and fans out the full peer list to the room. A heartbeat
+refreshes `lastSeen` without a cursor update; a 5 s sweeper removes sessions
+unseen for 60 s; a socket close removes its session immediately. Presence is
+never written to Postgres.
+
+The client throttles pointer updates to 25 Hz, sends a heartbeat every 20 s, and
+interpolates remote cursors on `requestAnimationFrame`. Selection highlights are
+drawn from the same ephemeral message as the cursor, so they cannot outlive the
+peer.
+
+### 15.4 Persistence and restart
+
+- `Store` abstracts `MemoryStore` and `PostgresStore`. `STORE=auto` probes
+  `DATABASE_URL` and falls back to memory; `postgres` and `memory` force it.
+- `RoomPersistence` loads a room from the newest snapshot (full CRDT state,
+  including tombstones and register versions) plus later operations, installs it
+  in the registry, appends every accepted batch through a per-room serial queue,
+  and snapshots every 100 ops / 60 s. A late resend that predates the snapshot
+  is rejected by the persisted `seen` set, so it cannot overwrite newer state or
+  resurrect a deleted object.
+- `index.ts` flushes on `SIGINT`/`SIGTERM` before exiting.
+- The memory store is intentionally ephemeral. After a restart, old access
+  tokens are rejected because their user row is gone — the product fails closed
+  instead of admitting a stale session into a fresh store. Postgres preserves
+  users, memberships, operations and snapshots, so both the scene and the owner
+  role survive.
+- Invites are not rows; they are bearer capabilities. Revoking one link
+  individually would need an invite table or token denylist, which is a later
+  addition.
+
+### 15.5 Client flow
+
+`useSync` bootstraps in this order:
+
+1. Read `?ws=` / `VITE_WS_URL` and derive the HTTP base.
+2. Load the cached session for that server; if missing/expired, call
+   `POST /api/auth/guest`.
+3. If HTTP is unreachable, fall back to local editing (the single-user product
+   still works without a gateway).
+4. Connect the socket, send `auth`, then `join {roomId, invite?}`.
+5. On `joined`, mirror the role/room identity in the store, report presence, and
+   start the heartbeat.
+6. On `unauthorized` or a `forbidden` join, stop reconnecting and render the
+   access gate. A dropped connection retries with backoff and resends the
+   in-memory outbox after `sync`.
+
+| Failure                    | Client behavior                                     |
+| -------------------------- | --------------------------------------------------- |
+| Gateway absent / HTTP down | Local fallback; status bar says local/offline       |
+| Expired cached session     | Silently obtain a fresh guest                       |
+| Server rejects the token   | Clear cache, show access gate, do not loop          |
+| Join denied                | Access gate with the reason, no editor toolbar      |
+| Viewer tries to edit       | UI disabled; store refuses; server would reject too |
+| Socket drops               | Retry, resync, replay unacked outbox (same tab)     |
+
+### 15.6 How Stage 4 is tested
+
+| Test                                   | What it proves                                                                            |
+| -------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `shared/src/crdt/serialize.test.ts`    | Full CRDT snapshot round-trip, tombstones, register versions, seen ids, reject corruption |
+| `server/src/auth/jwt.test.ts`          | Round-trip, tampering, expiry, wrong `typ`, constant header, injected clock               |
+| `server/src/http.test.ts`              | Guest auth, room create/list/get, invite roles, 401/403/404, CORS, body limits            |
+| `server/src/gateway.test.ts`           | Auth gate, membership/invite access, viewer rejection + `opIds`, presence, close          |
+| `server/src/persistence.test.ts`       | Full-CRDT snapshot + later ops reload, stale resend rejection, flush on shutdown          |
+| `server/src/store/postgres.test.ts`    | Real Postgres schema, users/rooms/memberships/ops/snapshots round-trip                    |
+| `client/src/net/syncClient.test.ts`    | Auth/invite handshake, outbox replay, 25 Hz throttle, heartbeat, fatal errors             |
+| `client/src/net/useSync.test.ts`       | Guest bootstrap, cached session, local fallback, denial/expiry                            |
+| `client/src/canvas/PeerLayer.test.tsx` | Cursor interpolation, selection outlines, removal, zoom                                   |
+| `client/src/store/sceneStore.test.ts`  | Viewer/checking edit guards, cursor reporting, role state                                 |
+| `scripts/sync-smoke.mjs`               | Four browsers: owner/editor/viewer, Mallory denied, presence, read-only, restart          |
+
+The Postgres integration suite runs when `TEST_DATABASE_URL` is set (CI always
+sets it). The smoke test starts its own gateway on `:8099`; with Postgres it
+also restarts it and checks the persisted scene and owner. With the memory store
+it asserts that stale sessions fail closed and skips the durability phase.
+
+The Stage 4 checklist:
+
+- [x] Live cursors and selection highlights as ephemeral messages
+- [x] Cursor updates throttled to 25 Hz and interpolated on the client
+- [x] Guest JWT auth, room creation and share links
+- [x] Server-enforced owner/editor/viewer roles
+- [x] Postgres schema for users, documents, memberships, operations, snapshots
+- [x] Viewer edits rejected server-side and gated in the UI
+- [x] Expired and tampered tokens refused
+- [x] A cursor disappears when its socket closes
+- [x] No room access without a membership or signed invite
+- [x] Full-CRDT snapshot + op-log replay survives a restart
+- [x] A stale resend after a restart cannot overwrite or resurrect
+- [x] Multi-user browser smoke test passes
+
+---
+
+## 16. Roadmap
+
+| Stage    | Milestone                                                       | Exit criterion                            |
+| -------- | --------------------------------------------------------------- | ----------------------------------------- |
+| 0        | Monorepo, compose, CI, design doc, shared types                 | CI green; compose healthy                 |
+| 1        | Canvas, transform maths, operation pipeline, undo/redo          | 500 objects at 60 fps; ops only           |
+| 2        | WS gateway, naive LWW sync                                      | Two browsers move a rect live             |
+| 3 (done) | HLC, LWW-map, RGA z-order, tombstones, convergence fuzz tests   | 10 000 randomized schedules converge      |
+| 4 (done) | Presence, rooms, JWT auth, roles, Postgres log + snapshots      | 4-browser smoke; restart-safe             |
+| 5        | IndexedDB outbox, optimistic apply, text RGA, version restore   | Reload-safe offline edits; text converges |
+| 6        | Redis fan-out, k6 load tests, Dockerfiles, AWS deploy, CD, demo | 2 gateways; p95 < 80 ms @ 200; live URL   |

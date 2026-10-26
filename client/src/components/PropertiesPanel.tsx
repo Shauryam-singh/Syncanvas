@@ -1,18 +1,19 @@
 import { useState } from 'react';
 import { getObjectsInOrder, type SceneObject } from '@syncanvas/shared';
-import { useSceneStore } from '../store/sceneStore';
+import { selectCanEdit, useSceneStore } from '../store/sceneStore';
 
 interface NumberFieldProps {
   label: string;
   value: number;
   onCommit: (value: number) => void;
+  disabled?: boolean;
 }
 
 /**
  * A number input that only commits when the value is complete, so that
  * typing "-" or "1." does not dispatch an operation per keystroke.
  */
-function NumberField({ label, value, onCommit }: NumberFieldProps) {
+function NumberField({ label, value, onCommit, disabled = false }: NumberFieldProps) {
   const [text, setText] = useState(String(Math.round(value)));
   const [lastValue, setLastValue] = useState(value);
 
@@ -37,6 +38,7 @@ function NumberField({ label, value, onCommit }: NumberFieldProps) {
       <input
         type="number"
         value={text}
+        disabled={disabled}
         onChange={(event) => setText(event.target.value)}
         onBlur={commit}
         onKeyDown={(event) => {
@@ -54,6 +56,7 @@ export function PropertiesPanel() {
   const scene = useSceneStore((state) => state.scene);
   const selection = useSceneStore((state) => state.selection);
   const updateObject = useSceneStore((state) => state.updateObject);
+  const canEdit = useSceneStore(selectCanEdit);
 
   const selected: SceneObject[] = getObjectsInOrder(scene).filter((object) =>
     selection.includes(object.id),
@@ -84,6 +87,9 @@ export function PropertiesPanel() {
   return (
     <aside className="panel">
       <h2>Properties</h2>
+      {!canEdit ? (
+        <p className="panel-readonly">Read-only — you joined this room as a viewer.</p>
+      ) : null}
 
       <div className="panel-section">
         <h3>Transform</h3>
@@ -91,26 +97,31 @@ export function PropertiesPanel() {
           <NumberField
             label="X"
             value={active.x}
+            disabled={!canEdit}
             onCommit={(value) => updateObject(active.id, { x: value })}
           />
           <NumberField
             label="Y"
             value={active.y}
+            disabled={!canEdit}
             onCommit={(value) => updateObject(active.id, { y: value })}
           />
           <NumberField
             label="W"
             value={active.w}
+            disabled={!canEdit}
             onCommit={(value) => updateObject(active.id, { w: Math.max(1, value) })}
           />
           <NumberField
             label="H"
             value={active.h}
+            disabled={!canEdit}
             onCommit={(value) => updateObject(active.id, { h: Math.max(1, value) })}
           />
           <NumberField
             label="Rotation"
             value={active.rotation}
+            disabled={!canEdit}
             onCommit={(value) => updateObject(active.id, { rotation: value })}
           />
         </div>
@@ -123,6 +134,7 @@ export function PropertiesPanel() {
           <input
             type="color"
             value={active.fill}
+            disabled={!canEdit}
             onChange={(event) => updateObject(active.id, { fill: event.target.value })}
           />
         </label>
@@ -132,6 +144,7 @@ export function PropertiesPanel() {
             <input
               type="text"
               value={active.text ?? ''}
+              disabled={!canEdit}
               onChange={(event) => updateObject(active.id, { text: event.target.value })}
             />
           </label>

@@ -85,7 +85,7 @@ export function StatusBar() {
         <span className="status-bar__peers" title={peers.map((p) => p.displayName).join(', ')}>
           {peers.map((peer) => (
             <span
-              key={peer.userId}
+              key={peer.sessionId}
               className="status-bar__peer"
               style={{ background: peer.color }}
               aria-label={peer.displayName}
