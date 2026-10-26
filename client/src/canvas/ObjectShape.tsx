@@ -47,17 +47,32 @@ export const ObjectShape = memo(function ObjectShape({ object }: ObjectShapeProp
   if (object.type === 'text') {
     const fontSize = Math.max(12, Math.min(object.h * 0.6, 48));
     return (
-      <text
-        x={object.x}
-        y={object.y + object.h / 2}
-        dominantBaseline="middle"
-        fontSize={fontSize}
-        fontFamily="ui-sans-serif, system-ui, sans-serif"
-        fill={object.fill}
-        transform={transform}
-      >
-        {object.text ?? ''}
-      </text>
+      <g transform={transform}>
+        {/*
+          SVG text only hit-tests its glyphs, and an empty text object has no
+          glyphs at all. This transparent box makes the whole object selectable
+          and keeps empty text recoverable from the properties panel.
+        */}
+        <rect
+          className="object-text-hit"
+          x={object.x}
+          y={object.y}
+          width={object.w}
+          height={object.h}
+          fill="transparent"
+          pointerEvents="all"
+        />
+        <text
+          x={object.x}
+          y={object.y + object.h / 2}
+          dominantBaseline="middle"
+          fontSize={fontSize}
+          fontFamily="ui-sans-serif, system-ui, sans-serif"
+          fill={object.fill}
+        >
+          {object.text ?? ''}
+        </text>
+      </g>
     );
   }
 

@@ -383,7 +383,7 @@ export const useSceneStore = create<SceneStore>((set, get) => ({
       w: size.w,
       h: size.h,
       fill: DEFAULT_FILL[type],
-      text: type === 'text' ? 'Double-click to edit' : undefined,
+      text: type === 'text' ? 'New text' : undefined,
     });
     get().dispatch([{ kind: 'createObject', object }]);
     set({ selection: [object.id], tool: 'select' });

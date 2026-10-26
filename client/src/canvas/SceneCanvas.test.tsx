@@ -18,6 +18,19 @@ const rect: SceneObject = {
   zIndex: 0,
 };
 
+const text: SceneObject = {
+  id: 'text-1',
+  type: 'text',
+  x: 80,
+  y: 220,
+  w: 220,
+  h: 40,
+  rotation: 0,
+  fill: '#0f172a',
+  text: '',
+  zIndex: 1,
+};
+
 function pointer(type: string, clientX: number, clientY: number): MouseEvent {
   return new MouseEvent(type, {
     bubbles: true,
@@ -62,6 +75,20 @@ describe('SceneCanvas', () => {
 
     shape?.dispatchEvent(pointer('pointerdown', 100, 100));
     expect(store().selection).toEqual(['rect-1']);
+  });
+
+  it('selects a text object across its whole box, including when it is empty', () => {
+    useSceneStore.setState({
+      doc: createDoc([text]),
+      scene: createSceneState([text]),
+      selection: [],
+    });
+    const { container } = render(<SceneCanvas />);
+    const hitBox = container.querySelector('[data-object-id="text-1"] rect.object-text-hit');
+    expect(hitBox).not.toBeNull();
+
+    hitBox?.dispatchEvent(pointer('pointerdown', 100, 240));
+    expect(store().selection).toEqual(['text-1']);
   });
 
   it('turns a pointer drag into a move operation', () => {
