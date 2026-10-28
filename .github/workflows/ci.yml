@@ -143,3 +143,61 @@ jobs:
           npm run preview -w @syncanvas/client -- --port 5173 &
           npx wait-on http://localhost:5173 --timeout 60000
           npm run smoke:sync
+
+  scale:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: syncanvas
+          POSTGRES_PASSWORD: syncanvas
+          POSTGRES_DB: syncanvas
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U syncanvas -d syncanvas"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build the client and the gateway
+        run: |
+          npm run build:shared
+          npm run build -w @syncanvas/client
+          npm run build -w @syncanvas/server
+
+      - name: Run the two-gateway failover test
+        env:
+          SMOKE_CHANNEL: chrome
+          DATABASE_URL: postgres://syncanvas:syncanvas@localhost:5432/syncanvas
+          REDIS_URL: redis://localhost:6379
+          JWT_SECRET: ci-scale-smoke-secret
+        run: |
+          npm run preview -w @syncanvas/client -- --port 4173 &
+          npx wait-on http://localhost:4173 --timeout 60000
+          npm run smoke:scale

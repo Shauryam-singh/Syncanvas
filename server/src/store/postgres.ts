@@ -288,4 +288,13 @@ export class PostgresStore implements Store {
     if (!row || !isSerializedDoc(row.state?.doc)) return null;
     return { seq: Number(row.seq), doc: row.state.doc };
   }
+
+  async compactOperations(documentId: string, throughSeq: number): Promise<number> {
+    const result = await this.pool.query(
+      `DELETE FROM operations
+        WHERE document_id = $1 AND seq <= $2`,
+      [documentId, throughSeq],
+    );
+    return result.rowCount ?? 0;
+  }
 }

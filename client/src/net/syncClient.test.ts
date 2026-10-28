@@ -225,6 +225,59 @@ describe('the sync client', () => {
     });
   });
 
+  it('resyncs when a sequence gap never fills', () => {
+    vi.useFakeTimers();
+    try {
+      goLive();
+      sockets[0]?.receive({
+        t: 'ops',
+        roomId: 'demo',
+        seq: 3,
+        ops: [
+          {
+            id: 'op_later',
+            actorId: 'user_2',
+            hlc: { wall: 1, counter: 0, actorId: 'user_2' },
+            op: SET_X,
+          },
+        ],
+      });
+      expect(applied).toHaveLength(0);
+      expect(sockets[0]?.messages.filter((entry) => entry.t === 'sync')).toHaveLength(0);
+
+      vi.advanceTimersByTime(999);
+      expect(sockets[0]?.messages.filter((entry) => entry.t === 'sync')).toHaveLength(0);
+      vi.advanceTimersByTime(1);
+      expect(sockets[0]?.messages.filter((entry) => entry.t === 'sync')).toHaveLength(1);
+
+      // The state covers the gap; later frames continue from its watermark.
+      sockets[0]?.receive({
+        t: 'state',
+        roomId: 'demo',
+        snapshotSeq: 3,
+        objects: [],
+        ops: [],
+      });
+      sockets[0]?.receive({
+        t: 'ops',
+        roomId: 'demo',
+        seq: 4,
+        ops: [
+          {
+            id: 'op_after_gap',
+            actorId: 'user_2',
+            hlc: { wall: 2, counter: 0, actorId: 'user_2' },
+            op: SET_X,
+          },
+        ],
+      });
+      expect(applied).toHaveLength(1);
+      expect(applied[0]?.envelopes[0]?.id).toBe('op_after_gap');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('drops the operations that are older than the state it received', () => {
     goLive();
     sockets[0]?.receive({

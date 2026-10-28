@@ -4,11 +4,14 @@ Real-time collaborative scene editor ("Figma-lite") with a hand-rolled CRDT.
 This document is the source of truth for the data model, wire protocol and CRDT
 semantics; it is intended to evolve into the public README as the project ships.
 
-Stage 4 is implemented: guest JWT sessions, rooms and signed invites, enforced
-owner/editor/viewer roles, ephemeral presence, and a Postgres operation log with
-snapshots. The gateway is still a single process; the Redis pub/sub and
-load-balancer path in §2 and §9 is the Stage 6 target, while the auth, presence,
-role and persistence layers described there are real today.
+Stage 5 is implemented: guest JWT sessions, rooms and signed invites, enforced
+owner/editor/viewer roles, presence, and a Postgres operation log with snapshots
+and compaction. Two or more gateways share rooms through Redis pub/sub; Redis
+assigns each accepted batch one room-wide sequence and every gateway applies
+that same order. Nginx (or the failover proxies in the scale smoke) can send a
+browser to any instance; if an instance dies, the client reconnects and resyncs
+from Postgres. Stage 6 contains the remaining client-local work (IndexedDB
+outbox, optimistic apply, text RGA, named restore) and load testing.
 
 ---
 
@@ -39,41 +42,41 @@ role and persistence layers described there are real today.
 
 ```
                 ┌─────────────────────────────────────────────┐
-                │              Load balancer                 │
-                │        (WS sticky by roomId hash)          │
+                │              Nginx / LB                     │
+                │      least connections, no room affinity    │
                 └────────┬──────────────────────┬─────────────┘
                          │                      │
                  ┌───────▼────────┐     ┌───────▼────────┐
                  │ Gateway  A     │     │ Gateway  B     │   Node.js + ws
                  │ - auth (JWT)   │     │ - auth (JWT)   │
-                 │ - CRDT merge   │     │ - CRDT merge   │
+                 │ - CRDT replica │     │ - CRDT replica │
                  │ - presence     │     │ - presence     │
+                 │ - Postgres log │     │ - Postgres log │
                  └───┬────────┬───┘     └───┬────────┬───┘
                      │        │             │        │
         publish/sub ─┘        └───┬─────────┘        └─── publish/sub
                      ┌────────────▼────────────┐
                      │   Redis                 │
-                     │ - pub/sub  room:{id}    │
-                     │ - presence TTL keys     │
-                     │ - room ownership locks  │
+                     │ - pub/sub room:{id}     │
+                     │ - per-room sequence key │
                      └────────────┬────────────┘
                                   │
                      ┌────────────▼────────────┐
                      │   PostgreSQL            │
                      │ - rooms, members        │
-                     │ - op log                │
-                     │ - snapshots / versions  │
+                     │ - compacted op log      │
+                     │ - full-CRDT snapshots   │
                      └─────────────────────────┘
 
-   Client (React + Vite): CRDT merge → project → render (optimistic apply is stage 5)
+   Client (React + Vite): CRDT merge → project → render (optimistic apply is Stage 6)
 ```
 
-> **Implemented vs target.** Stage 4 runs this stack as a **single gateway**:
-> the auth, room registry, presence, Postgres store and snapshots are live, but
-> the load balancer and Redis fan-out are not wired yet. §9 describes the
-> sharding design; §15 describes what Stage 4 actually ships.
+Redis is the **wire ordering point**, not the source of truth. Every gateway
+subscribes to the wildcard room channel and can serve any room; no sticky
+routing or room-ownership lock is needed. The bus is optional: without a
+reachable `REDIS_URL`, a single gateway remains a complete standalone service.
 
-**Request flow for an edit (stage 4 — what is implemented today)**
+**Request flow for an edit (Stage 5 — what is implemented today)**
 
 0. The browser signs in through `POST /api/auth/guest`, connects the WebSocket
    and sends `auth {token}`. The gateway verifies the HS256 access token, loads
@@ -84,42 +87,38 @@ role and persistence layers described there are real today.
 2. The client stamps the operations with its HLC, puts the envelopes in its
    outbox and sends an `ops` batch over the WebSocket. It does **not** apply
    them locally yet — the author waits for the echo.
-3. The gateway checks the room membership/invite and the role. A viewer's batch
-   is rejected with `forbidden` and the rejected operation ids; an editor or
-   owner batch is stamped with the actor identity for the socket, merged into
-   the room's CRDT document (order-independent), assigned the next sequence
-   number as a broadcast watermark, appended to Postgres, and broadcast to the
-   room — the author included.
-4. Every client merges the same envelopes into its own document and projects
+3. The gateway checks membership/invite and role. A viewer's batch is rejected
+   with `forbidden` and the rejected ids. An editor/owner batch is normalized
+   with the socket's actor identity and published on the room bus.
+4. Redis runs one Lua script that raises the room counter to the gateway's
+   current `floor` when it is missing or lower, increments it, substitutes that
+   sequence into the message, publishes it, and returns the sequence. The
+   allocation and publish therefore cannot be reordered by another gateway.
+5. Every gateway receives the message, including the origin. Messages are
+   queued per room; each gateway lazily loads the room from Postgres if needed,
+   then merges the batch in bus order. The origin broadcasts the accepted
+   envelopes to its clients **before** sending `ack`, so the author can identify
+   the echo as its own for undo. Every gateway appends the accepted operations
+   with the bus sequence; the `(document_id, op_id)` key makes duplicate writes
+   from other replicas idempotent.
+6. A duplicate-only publish still consumes a sequence. To keep client
+   watermarks contiguous, the gateway broadcasts an empty `ops` frame at that
+   sequence, then acknowledges the ids.
+7. Every client merges the same envelopes into its own document and projects
    the result. Because the merge is commutative, delivery order does not
-   matter; all replicas reach the same scene.
-5. The gateway acknowledges the batch; the client drops the envelopes from
-   its outbox. A client that reconnects sends `sync {snapshotSeq, opIds}` and
-   re-sends only what the gateway is missing.
+   matter; bus order gives all replicas the same `seq` watermark.
+8. A client that reconnects sends `sync {snapshotSeq, opIds}` and re-sends only
+   what the gateway is missing. The reconnect may land on another instance,
+   which loads the same room from Postgres.
 
-**Request flow for an edit (stage 5 — the target architecture)**
-
-1. User drags a rect. Client mutates its local CRDT state and renders
-   immediately (optimistic, never blocked on network).
-2. Client stamps the op with its local HLC, appends it to the offline outbox
-   (IndexedDB), and sends an `ops` batch over WebSocket.
-3. Gateway validates role (`editor`+), merges the op into the authoritative
-   state (order-independent merge, so arrival order does not matter), appends
-   to the Postgres op log, acks the author, and publishes to `room:{id}`.
-4. Other gateways subscribed to `room:{id}` receive the publish and fan the op
-   out to their local sockets.
-5. A snapshot worker folds the op log into a snapshot every N ops / T seconds
-   and compacts the log.
-
-> **The gap between the two flows is the point of the project.** Stage 2 ordered
-> operations centrally, which converged but paid a round trip on every edit and
-> could not merge two offline histories. Stage 3 replaced the ordering point
-> with an order-independent merge: conflicts now resolve by version, not by
-> arrival order, and the gateway is a relay rather than an arbiter. Stage 4 added
-> the surrounding product (auth, roles, presence, durable log/snapshots). What
-> remains for stage 5 is applying locally _before_ the echo and keeping the
-> outbox in IndexedDB; Redis fan-out and log compaction belong to stage 6. §13
-> measures what stage 2 cost.
+**The gap between Stage 2 and Stage 5 is the point of the project.** Stage 2
+ordered operations centrally in one process, which converged but paid a round
+trip and could not merge two offline histories. Stage 3 replaced the _merge_
+ordering point with an order-independent CRDT: conflicts resolve by version, not
+arrival order. Stage 5 adds the _wire_ ordering point back only where it helps —
+Redis gives all gateways one sequence for acknowledgement and client watermarks
+— while the CRDT remains the authority for values. Optimistic local apply,
+IndexedDB and per-character text remain Stage 6. §13 measures what Stage 2 cost.
 
 ---
 
@@ -136,7 +135,7 @@ Defined in `shared/src/object.ts`, consumed by client, server and tests.
 | `rotation` | `number`                                  | Degrees, around center                                    |
 | `fill`     | `string`                                  | CSS color                                                 |
 | `zIndex`   | `number`                                  | Derived from the RGA z-order sequence                     |
-| `text`     | `string?`                                 | Only for `type: 'text'`; LWW now, per-char RGA in stage 5 |
+| `text`     | `string?`                                 | Only for `type: 'text'`; LWW now, per-char RGA in Stage 6 |
 
 The mutable property set (`MUTABLE_PROPS`) is an explicit allowlist: the CRDT
 never accepts a `setProp` for `id` or `type`, so identity is immutable and
@@ -255,7 +254,7 @@ In stage 3 the operation is validated and remembered — so its id stays
 idempotent, and the wire format does not change later — but the projection
 ignores it. Text is still an LWW register over the whole string. The generic
 RGA in `rga.ts` is the structure the per-character version will reuse (origins
-are character keys, deletions are tombstones); that lands in stage 5.
+are character keys, deletions are tombstones); that lands in Stage 6.
 
 **Why not Yjs?** Rolling our own is a deliberate scope choice: the LWW-map +
 RGA + HLC core is a few hundred lines, is fully testable with property-based
@@ -436,35 +435,40 @@ CREATE INDEX snapshots_document_seq_idx
 
 **Store selection:** `STORE=auto` probes `DATABASE_URL` and uses Postgres when
 reachable, otherwise the memory store; `postgres` and `memory` force a mode.
-`/healthz` reports the active kind. The memory store deliberately keeps the same
-`Store` interface, so the gateway, HTTP API and tests are identical in both
-modes.
+`/healthz` reports the active store, whether Redis fan-out is connected, and the
+instance name. The memory store deliberately keeps the same `Store` interface,
+so the gateway, HTTP API and tests are identical in both modes. Redis is also
+optional and is reported separately; a gateway without it is standalone.
 
 **Write path:** accepted batches are appended through a per-room serial queue.
-Writes are fire-and-forget for the socket path; shutdown awaits `flush()` so a
-restart does not lose the last edits. The `(document_id, op_id)` primary key is
-the replay/dedupe guard.
+In a cluster every gateway sees the same bus frames, so several instances may
+insert the same operations with the same `seq`; `(document_id, op_id)` is the
+idempotent guard. Writes are fire-and-forget for the socket path; shutdown
+drains bus work and awaits `flush()` so a restart does not lose the last edits.
 
 **Read path:** `doc = deserializeDoc(newest snapshot at seq M) + operations
 WHERE seq > M`, merged in any order thanks to the CRDT invariant. The snapshot
 carries the full merge state, so a late or replayed operation is rejected by
-the same stamps and `seen` set as on the live replica. With no snapshot (or an
-unreadable one) the full log is replayed over the deterministic seed scene.
+the same stamps and `seen` set as on the live replica. If the log was compacted,
+everything at or below `M` is already represented in the snapshot. With no
+snapshot (or an unreadable one) the gateway replays the remaining log over the
+deterministic seed scene.
 
 **Invites are not stored.** A share link is an HS256 token carrying
 `{room, role, owner, exp}`; redeeming it calls `grant()` and persists a normal
 membership. There is therefore no invite table to clean up, and a link can be
 revoked only by rotating `JWT_SECRET` or by removing the resulting membership.
-That is a deliberate Stage 4 tradeoff; per-link revocation belongs with the
-durable history work in Stage 5.
+That is a deliberate Stage 4 tradeoff; per-link revocation belongs with later
+history work.
 
 ---
 
 ## 7. Snapshots and version history
 
-**Implemented (stage 4):**
+**Implemented (Stage 5):**
 
-- Trigger: every **100 ops** or **60 s** of activity per room.
+- Trigger: every **100 ops** or **60 s** of activity per room, both configurable
+  with `SNAPSHOT_EVERY` and `SNAPSHOT_INTERVAL_MS`.
 - A snapshot stores the **whole CRDT document** (`serializeDoc`): every
   register version, tombstone, RGA order entry and the `seen` id set. Storing
   only the projected scene would lose the metadata that makes late replays
@@ -474,32 +478,42 @@ durable history work in Stage 5.
 - The snapshot is written behind the room's serial write queue, tagged with the
   room's sequence watermark. Writing is fire-and-forget on the socket path;
   shutdown awaits `flush()`.
-- Loading a room takes the newest snapshot and replays only operations with a
-  higher `seq`. If the snapshot is missing or unreadable, the gateway falls back
-  to the seed scene plus the full log. The merge is order-independent, so replay
+- **Compaction follows the snapshot in the same queue.** After a snapshot at
+  sequence `M` is durable, `DELETE FROM operations WHERE document_id = ? AND
+seq <= M` runs. The snapshot carries everything those rows produced, and its
+  `seen` set still rejects a late resend, so deleting the rows cannot change a
+  later replay. Rows after `M` remain until the next snapshot.
+- Loading takes the newest snapshot and replays only operations with a higher
+  `seq`. If the snapshot is missing or unreadable, the gateway falls back to the
+  seed scene plus the remaining log. The merge is order-independent, so replay
   order is irrelevant.
 - A load also prunes untouched records for **retired seed objects** (the old
   `demo-text` prompt). The record must still carry only `seed:*` stamps; an
   object somebody moved or edited is user data and is kept.
 - Snapshots are **internal checkpoints**, not user-visible versions.
+- **No leader election.** Any instance holding the room may snapshot and
+  compact at its watermark. Two instances can write equivalent snapshots and
+  issue the same deletion; duplicate work is harmless because snapshot rows are
+  append-only and deletion is idempotent.
 
 **Not implemented yet:**
 
-- Compaction. Operation rows below the newest snapshot are still retained, and
-  the snapshot's `seen` set grows with them, so the log is monotonic. Deleting
-  covered rows needs a watermark plus a rule for which `seen` ids must survive
-  for late-ack replays and future named versions.
 - Named versions, restore and history browsing.
-- Multi-gateway single-writer election. Today's single gateway is the only
-  writer; the Redis `SET NX PX` lock described in §9 belongs with fan-out.
+- Retention of older snapshots. They accumulate; a later job can prune all but
+  the newest without affecting replay.
+- Dedicated background snapshot workers. Today a room is snapshotted by the
+  gateway that sees the threshold, plus a final flush on shutdown.
 
 ---
 
 ## 8. Presence, offline and reconnect
 
-**Presence** is ephemeral and lives only in the gateway's room registry. It is
+**Presence** is ephemeral and lives in each gateway's room registry. It is
 keyed by the per-connection `sessionId`, not `userId`, so two tabs with the
-same account do not overwrite each other.
+same account do not overwrite each other. With Redis, join/update/leave frames
+are also published on the room bus; every other instance stores them as
+`remoteMembers` and broadcasts the merged local+remote roster. The origin
+ignores its own presence echo because it already updated the local roster.
 
 - The client sends at most one presence message per 40 ms (25 Hz, trailing
   edge) and a heartbeat every 20 s. The server forwards a peer's presence at
@@ -507,78 +521,114 @@ same account do not overwrite each other.
   capped at 1 000 ids.
 - The client interpolates the last received cursor towards its target on
   `requestAnimationFrame`; the network rate stays low while motion looks smooth.
-- The server sweeps sessions unseen for 60 s every 5 s, and removes a session
-  immediately when its socket closes. A closed tab therefore disappears without
-  waiting for the TTL.
+- The server sweeps local and remote sessions unseen for 60 s every 5 s, and
+  removes a local session immediately when its socket closes. A closed tab
+  therefore disappears without waiting for the TTL; a crashed gateway's remote
+  cursors disappear when their heartbeats stop and the sweep reaches the TTL.
 - Presence never touches Postgres and is not replayed after reconnecting.
 
-**Offline / reconnect** in stage 4:
+**Offline / reconnect** in Stage 5:
 
 1. Edits made while the socket is down stay in the client's **in-memory**
    outbox. The store still applies them locally only after the echo, so an
    offline edit is visible in the editor but pending until reconnect.
 2. Reconnect sends `sync {snapshotSeq, opIds}`; the gateway replies with the
-   current projection and acknowledges ids it already has.
+   current projection and acknowledges ids it already has. Because every
+   instance can load the room from Postgres, the browser may reconnect to a
+   different gateway after an instance failure.
 3. Unacknowledged envelopes are re-sent and deduped by `(documentId, opId)` in
    the CRDT and by the Postgres `(document_id, op_id)` primary key.
 4. A page reload discards the outbox. IndexedDB persistence and local-first
-   optimistic apply are stage 5.
+   optimistic apply are Stage 6.
 
-The eventual success metric remains outbox entries acked / total (target: 100 %
-under randomized partitioning in the stage 5 fuzz tests).
+Failover is reconnect-based: an in-flight WebSocket is not migrated between
+processes. Nginx's passive checks stop sending new connections to a failed
+instance, and `SyncClient` retries the same `?ws=` endpoint (through the same
+proxy or load balancer) until it reaches a healthy gateway.
 
 ---
 
-## 9. Scaling gateways (target)
+## 9. Scaling gateways (implemented)
 
-> Stage 4 runs **one** gateway process. The following is the design for
-> horizontal scale; it is not wired yet.
+Two gateways plus Redis and Nginx are a supported local deployment. No room is
+pinned to a process.
 
-- Rooms are sharded onto gateways by `hash(roomId) % N` (consistent hashing);
-  the LB only needs L4/round-robin for connections, room affinity comes from
-  routing on the `join` message or from clients reconnecting to the owning
-  instance via a 302-style `redirect` message.
-- Cross-instance fan-out: every gateway `SUBSCRIBE`s to the rooms hosted locally
-  and publishes batched ops to `room:{roomId}` on Redis. One Redis, one channel
-  per room.
-- A Redis `SET NX PX` lock (`lock:snapshot:{roomId}`, 10 s TTL) elects the
-  snapshot writer per room.
-- Backpressure: per-socket send queues with high-water mark; slow consumers get
-  `sync`-style resumable catch-up instead of unbounded buffering.
-- Metrics (Prometheus): connections/instance, ops/s, `p50/p95 sync latency`
-  (client timestamp → `ack`), queue depth, Redis round-trip.
-- Load test (k6, stage 6): ramp to 200 virtual users per room, assert p95 ack
-  latency < 80 ms and zero convergence mismatches at the end.
+- **Lazy replication.** Startup installs rooms that already exist; after that, a
+  gateway loads a room on the first local `join` or the first bus frame for it.
+  A browser can therefore land on any instance and still get the room. Rooms
+  that no local client and no bus traffic touch stay out of memory.
+- **Wildcard subscription.** Each gateway `PSUBSCRIBE`s to
+  `syncanvas:room:*`, not just locally hosted rooms. That is what lets a
+  gateway that has never seen a room receive a presence frame or operation and
+  create its local replica. The cost is one copy of every room's traffic per
+  gateway; room-level subscription would be an optimization for a larger fleet.
+- **Redis owns the sequence.** The Lua script on `syncanvas:room:{id}:seq`
+  raises a missing or stale counter to `floor`, `INCR`s it, substitutes the
+  sequence into the payload, and `PUBLISH`es atomically. Two instances can
+  never allocate the same number or publish out of allocation order, and a
+  Redis restored from an older snapshot cannot reissue a sequence that is
+  already in Postgres. Redis is transport, so losing it does not lose
+  operations; it only stops the clustered path, and `/healthz` reports
+  `bus: null`.
+- **Every instance persists.** All gateways apply the same frames and append
+  accepted operations to Postgres. There is no designated writer. Duplicate
+  inserts are idempotent and every instance can serve a reconnect.
+- **Failed applies are fail-fast.** Redis pub/sub cannot replay a frame that a
+  replica failed to load or merge. Instead of continuing with a gap, that
+  instance invalidates its local replica and closes its clients in the room;
+  they reconnect, reload the room from Postgres and resend unacknowledged
+  outbox entries.
+- **No snapshot lock.** Each instance may snapshot after its own threshold. The
+  snapshot is tagged with the room watermark and compaction deletes only rows
+  at or below that watermark, so concurrent snapshots are safe.
+- **Presence on the bus.** Roster changes are published per room and merged by
+  receiving instances; presence remains memory-only and expires if an owner
+  process crashes without saying goodbye.
+- **Nginx.** The Compose `web` image serves the built client and proxies
+  `/api/`, `/healthz` and `/ws` to both gateways with least-connections and
+  passive failure detection. There is no sticky-session requirement. A failed
+  socket is retried by the client and resynced against another instance.
+- **Registration and local verification.** `npm run scale:up` builds the gateway
+  and web images and starts Postgres, Redis, `gateway-a`, `gateway-b` and Nginx.
+  `scripts/scale-smoke.mjs` runs the same topology on the host using TCP
+  proxies: two browsers edit across instances, one gateway is killed, the
+  client reconnects, both gateways restart, and the scene is checked again.
+- **Not included yet.** Prometheus metrics, per-socket backpressure and the k6
+  load test remain later work. The existing reconnect path is the backpressure
+  boundary for a slow or dead instance.
 
 ---
 
 ## 10. Design decisions and tradeoffs
 
-| Decision                                        | Why                                                                            | Cost                                                                                   |
-| ----------------------------------------------- | ------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------- |
-| Hand-rolled LWW-map + RGA + HLC instead of Yjs  | Proves CRDT knowledge; ~300 LOC core; fully fuzz-testable; no black box        | No free sub-transaction text merging; we own the tombstone/compaction edge cases       |
-| Per-property LWW registers                      | Concurrent edits to different properties never conflict                        | Same-property concurrent edits lose one value (accepted for canvas props)              |
-| LWW over OT/transform functions                 | Order-independent merge is trivially correct and testable                      | "Latest wins" can silently discard intent for the _same_ property                      |
-| HLC over pure Lamport                           | Close to wall time → intuitive conflicts; no trusted clock needed              | Absorbs a peer's future wall clock on receipt (no clamping — §4.1)                     |
-| Undo = new inverse ops                          | Reuses the merge path; works offline and across users                          | Undo is itself an edit (LWW, not isolation-preserving)                                 |
-| JSON wire format first                          | Debuggable, types shared directly                                              | ~1.5× bytes vs MessagePack; revisit after load tests                                   |
-| Op log + snapshots in Postgres                  | One transactional store; replay over the snapshot is order-independent         | Log growth requires disciplined compaction (not implemented yet)                       |
-| Redis pub/sub (not Streams)                     | Ops are replayable from Postgres — Redis is transport, not source of truth     | No Redis-side durability needed (and none claimed); not wired in stage 4               |
-| Guest-only auth (no passwords)                  | No email/verification scope, instant onboarding, no credential database        | Identity is device-scoped; clearing storage loses memberships without a link           |
-| Dependency-free HS256 JWT                       | Tiny, auditable, one shared secret for access tokens and invites               | Secret rotation invalidates every session and link; no key ids/OIDC                    |
-| Invite as a signed bearer capability            | No invite table, no cleanup, links work after an ephemeral-store restart       | Cannot revoke one link; only rotating the secret or removing the membership            |
-| Roles enforced in the gateway, mirrored in UI   | A viewer cannot edit even with a modified client; UX still explains read-only  | Two places to keep in sync; the server remains the source of truth                     |
-| Presence in memory keyed by connection          | Multi-tab safe, zero DB writes, disappears immediately on close                | Not shared across future gateways; lost on restart (acceptable for presence)           |
-| Presence throttled 25 Hz + client interpolation | Cuts traffic ~40× versus pointer-move rate while looking smooth                | A receiver sees a slightly delayed final position                                      |
-| Snapshot every 100 ops / 60 s                   | Bounds replay on load without snapshotting every batch                         | Up to 100 operations replay; snapshots accumulate until compaction exists              |
-| `STORE=auto` fallback to memory                 | Clone-and-run works without Docker/Postgres                                    | A misconfigured production gateway can silently start ephemeral; `/healthz` reports it |
-| In-memory outbox (stage 4)                      | Reconnect replays unacked edits across a socket drop                           | A page reload loses them; IndexedDB is stage 5                                         |
-| Delete-wins existence rule                      | No late `setProp` can resurrect a deleted object; ties are deterministic       | A create tied exactly with a delete loses; undo must be strictly later                 |
-| Operation id as the final tie-break             | Even identical HLCs resolve the same way on every replica                      | Version compare is a 4-tuple, not just an HLC compare                                  |
-| Explicit top/bottom origins for z-order         | Creation appends, "send to back" prepends — both have a meaning                | One extra field in every order entry                                                   |
-| Gateway merges but no longer orders             | Server and clients run the same code path, so they cannot disagree             | The gateway must hold a replica of every room it serves                                |
-| No optimistic apply (stage 3/4)                 | The scene is always a prefix of the replicated document — easy to reason about | Every keystroke waits for the round trip; feels laggy on a bad link (stage 5)          |
-| Broadcast to the author as well                 | The author merges the same envelopes as everybody else                         | The author cannot render before the server answers                                     |
+| Decision                                        | Why                                                                            | Cost                                                                                     |
+| ----------------------------------------------- | ------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------- |
+| Hand-rolled LWW-map + RGA + HLC instead of Yjs  | Proves CRDT knowledge; ~300 LOC core; fully fuzz-testable; no black box        | No free sub-transaction text merging; we own the tombstone/compaction edge cases         |
+| Per-property LWW registers                      | Concurrent edits to different properties never conflict                        | Same-property concurrent edits lose one value (accepted for canvas props)                |
+| LWW over OT/transform functions                 | Order-independent merge is trivially correct and testable                      | "Latest wins" can silently discard intent for the _same_ property                        |
+| HLC over pure Lamport                           | Close to wall time → intuitive conflicts; no trusted clock needed              | Absorbs a peer's future wall clock on receipt (no clamping — §4.1)                       |
+| Undo = new inverse ops                          | Reuses the merge path; works offline and across users                          | Undo is itself an edit (LWW, not isolation-preserving)                                   |
+| JSON wire format first                          | Debuggable, types shared directly                                              | ~1.5× bytes vs MessagePack; revisit after load tests                                     |
+| Op log + snapshots in Postgres                  | One transactional store; replay over the snapshot is order-independent         | Compaction discards old operation history; named versions need separate retention        |
+| Redis pub/sub (not Streams)                     | Ops are replayable from Postgres — Redis is transport, not source of truth     | One broker is required for cross-instance fan-out; pub/sub messages are not durable      |
+| Redis assigns the room-wide sequence            | All instances see one order; no duplicate watermarks and no sticky routing     | Every edit crosses Redis before ack; Redis becomes a latency dependency                  |
+| Every gateway persists its own copy             | Any instance can serve a reconnect; no writer election                         | Duplicate `INSERT` work on every replica (idempotent, but not free)                      |
+| Empty `ops` frame for a duplicate-only publish  | Clients keep a contiguous `seq` watermark                                      | An unusual empty batch on the wire                                                       |
+| Guest-only auth (no passwords)                  | No email/verification scope, instant onboarding, no credential database        | Identity is device-scoped; clearing storage loses memberships without a link             |
+| Dependency-free HS256 JWT                       | Tiny, auditable, one shared secret for access tokens and invites               | Secret rotation invalidates every session and link; no key ids/OIDC                      |
+| Invite as a signed bearer capability            | No invite table, no cleanup, links work after an ephemeral-store restart       | Cannot revoke one link; only rotating the secret or removing the membership              |
+| Roles enforced in the gateway, mirrored in UI   | A viewer cannot edit even with a modified client; UX still explains read-only  | Two places to keep in sync; the server remains the source of truth                       |
+| Presence in memory keyed by connection          | Multi-tab safe, zero DB writes, disappears immediately on close                | Replicated over Redis but memory-only; a crashed instance leaves ghost cursors until TTL |
+| Presence throttled 25 Hz + client interpolation | Cuts traffic ~40× versus pointer-move rate while looking smooth                | A receiver sees a slightly delayed final position                                        |
+| Snapshot every 100 ops / 60 s + compaction      | Bounds replay and log growth without snapshotting every batch                  | Up to 100 operations replay; concurrent instances may duplicate snapshot work            |
+| `STORE=auto` fallback to memory                 | Clone-and-run works without Docker/Postgres                                    | A misconfigured production gateway can silently start ephemeral; `/healthz` reports it   |
+| In-memory outbox (Stage 5)                      | Reconnect replays unacked edits across a socket drop or gateway failure        | A page reload loses them; IndexedDB is Stage 6                                           |
+| Delete-wins existence rule                      | No late `setProp` can resurrect a deleted object; ties are deterministic       | A create tied exactly with a delete loses; undo must be strictly later                   |
+| Operation id as the final tie-break             | Even identical HLCs resolve the same way on every replica                      | Version compare is a 4-tuple, not just an HLC compare                                    |
+| Explicit top/bottom origins for z-order         | Creation appends, "send to back" prepends — both have a meaning                | One extra field in every order entry                                                     |
+| Gateway merges but does not choose values       | Server and clients run the same code path, so they cannot disagree             | The gateway must hold a replica of every room it serves                                  |
+| No optimistic apply (Stage 5)                   | The scene is always a prefix of the replicated document — easy to reason about | Every edit waits for Redis and the echo; feels laggy on a bad link (Stage 6)             |
+| Broadcast to the author before `ack`            | The author merges the same envelopes and still recognizes its undo entries     | Every edit pays one bus round trip before the client sees confirmation                   |
 
 ---
 
@@ -601,10 +651,12 @@ syncanvas/
 │   ├── src/
 │   │   ├── index.ts         # HTTP + WebSocket upgrade + graceful flush
 │   │   ├── http.ts          # Guest auth, rooms, invites, CORS, /healthz
-│   │   ├── gateway.ts       # Socket auth, access control, presence, ops
+│   │   ├── gateway.ts       # Socket auth, access control, presence, bus echo, ack
+│   │   ├── bus.ts           # Redis room bus, Lua sequence+publish, memory test bus
 │   │   ├── auth/jwt.ts      # Dependency-free HS256 access + invite tokens
 │   │   ├── rooms.ts         # Room registry, roles, presence TTL, CRDT replica
-│   │   ├── persistence.ts   # Load, append, snapshot every 100 ops / 60 s, flush
+│   │   ├── persistence.ts   # Lazy load, append, snapshot, compaction, flush
+│   │   ├── scaling.test.ts  # Two gateways on one shared memory bus
 │   │   ├── store/           # Store interface, memory + Postgres, schema.sql
 │   │   └── config.ts
 │   └── tsconfig.json
@@ -624,13 +676,17 @@ syncanvas/
 ├── scripts/
 │   ├── browser.mjs          # Chromium resolution shared by the smoke tests
 │   ├── smoke.mjs            # Single-user Playwright smoke test
-│   └── sync-smoke.mjs       # Multi-user auth/presence/role/restart smoke test
+│   ├── sync-smoke.mjs       # Multi-user auth/presence/role/restart smoke test
+│   └── scale-smoke.mjs      # Two gateways, failover, full restart
+├── deploy/
+│   └── nginx.conf           # Static client + /api and /ws proxy to both gateways
 ├── docs/
 │   └── DESIGN.md            # This document
-├── docker-compose.yml       # Postgres 16 + Redis 7
+├── Dockerfile               # Multi-stage gateway image + Nginx web image
+├── docker-compose.yml       # Postgres + Redis; `scale` profile adds gateways + web
 ├── eslint.config.mjs
 ├── tsconfig.base.json
-└── .github/workflows/ci.yml # lint/format/typecheck/test/build + Postgres + smoke + sync
+└── .github/workflows/ci.yml # lint/format/typecheck/test/build + Postgres + smoke + sync + scale
 ```
 
 **Stage 0 acceptance:** `docker compose up` healthy on a clean machine, CI
@@ -695,7 +751,7 @@ travels to every replica (§4.6).
 ### 12.4 What is _not_ in stage 1
 
 - `editText` is accepted but ignored: text is edited as a whole string
-  through `setProp('text', …)` until the per-character RGA lands in stage 5.
+  through `setProp('text', …)` until the per-character RGA lands in Stage 6.
 - No WebSocket, no presence, no persistence — stage 2 onwards.
 - Concurrent creates were order sensitive; stage 3 replaced the order array
   with an RGA (§4.3).
@@ -751,7 +807,7 @@ in what order operations are broadcast.**
 - **No optimistic apply.** The client does not apply its own operations when
   it creates them — it waits for the gateway to echo them back. The price is a
   round trip on every edit; the benefit is that the scene is always a prefix
-  of the replicated document. Local-first apply is stage 5.
+  of the replicated document. Local-first apply is Stage 6.
 - On reconnect the client sends `sync {snapshotSeq, opIds}`; the gateway
   acknowledges the operations it already has and sends the current state, and
   the client re-sends only what is missing.
@@ -768,7 +824,7 @@ not conflict-free:
 | Two users drag the same rect at the same time | One drag is lost; the winner depends on arrival order    | Later version wins on every replica                                                      |
 | Two users set different properties            | No conflict — the properties are independent             | Unchanged                                                                                |
 | Two users create an object at the same time   | Both survive, but their z-order depends on arrival order | RGA orders them deterministically                                                        |
-| A client is offline for a minute              | Its edits are lost: they never reach the gateway         | Replayed from the in-memory outbox on reconnect (stage 4); reload-safe outbox in stage 5 |
+| A client is offline for a minute              | Its edits are lost: they never reach the gateway         | Replayed from the in-memory outbox on reconnect (Stage 5); reload-safe outbox in Stage 6 |
 
 ### 13.4 How stage 2 is tested
 
@@ -830,7 +886,7 @@ cannot disagree about the merge rule.
 - **Full-state sync.** A joining client receives the projected scene, not the
   tombstones and register versions. That is sufficient for the operations it
   receives afterwards, but tombstone-aware client bootstrap is a later
-  refinement (the server-side persisted snapshot already exists in stage 4).
+  refinement (the server-side persisted snapshot and compaction exist in Stage 5).
 - **Tombstone compaction.** Deleted objects are kept forever; safe, but the
   document grows. Compaction needs a watermark past all in-flight replicas.
 - **Per-character text.** §4.4.
@@ -1023,14 +1079,149 @@ The Stage 4 checklist:
 
 ---
 
-## 16. Roadmap
+## 16. Stage 5 — durable room log and multi-gateway fan-out
 
-| Stage    | Milestone                                                       | Exit criterion                            |
-| -------- | --------------------------------------------------------------- | ----------------------------------------- |
-| 0        | Monorepo, compose, CI, design doc, shared types                 | CI green; compose healthy                 |
-| 1        | Canvas, transform maths, operation pipeline, undo/redo          | 500 objects at 60 fps; ops only           |
-| 2        | WS gateway, naive LWW sync                                      | Two browsers move a rect live             |
-| 3 (done) | HLC, LWW-map, RGA z-order, tombstones, convergence fuzz tests   | 10 000 randomized schedules converge      |
-| 4 (done) | Presence, rooms, JWT auth, roles, Postgres log + snapshots      | 4-browser smoke; restart-safe             |
-| 5        | IndexedDB outbox, optimistic apply, text RGA, version restore   | Reload-safe offline edits; text converges |
-| 6        | Redis fan-out, k6 load tests, Dockerfiles, AWS deploy, CD, demo | 2 gateways; p95 < 80 ms @ 200; live URL   |
+Stage 5 makes durability and scale part of the normal path rather than optional
+bookkeeping. The persistence files are `server/src/bus.ts`,
+`server/src/persistence.ts`, `server/src/rooms.ts`,
+`server/src/gateway.ts` and the two stores.
+
+### 16.1 Room-wide sequence and write path
+
+A standalone gateway increments `room.seq` when it accepts a batch. A clustered
+gateway sends the batch to `RedisRoomBus.publishOps(publication, floor)`:
+
+```lua
+local floor = tonumber(ARGV[1])
+local current = tonumber(redis.call('GET', KEYS[1]))
+if not current or current < floor then
+  redis.call('SET', KEYS[1], tostring(floor))
+end
+local seq = redis.call('INCR', KEYS[1])
+local payload = string.gsub(ARGV[2], ARGV[3], tostring(seq), 1)
+redis.call('PUBLISH', KEYS[2], payload)
+return seq
+```
+
+`floor` is the origin replica's current watermark. A missing key is seeded and
+a stale counter is raised, so a gateway that restarted with a newer snapshot
+cannot move the allocator backwards; `INCR` remains the allocator afterwards.
+`ARGV[3]` is a per-call marker that occupies the `seq` slot, so user-controlled
+ids cannot be mistaken for it. The same script publishes the payload, so no
+other gateway can allocate or publish between the increment and the message.
+
+The origin does not merge before publishing. It filters ids already present in
+its replica only to avoid publishing a pure resend. When the Redis echo arrives,
+the room is loaded if necessary and `registry.applyOps(roomId, ops, seq)`
+merges only the new envelopes and advances `room.seq` to at least the bus
+sequence. `persistence.append()` receives that same `seq`. Every other gateway
+does the same, so the Postgres rows for a batch agree on `seq` regardless of
+which process wrote them. `(document_id, op_id)` makes those writes idempotent.
+
+The origin broadcasts the accepted envelopes before `ack`; `SyncClient` uses
+the still-pending outbox ids to label the echo `mine`, which drives undo
+bookkeeping. If a replica cannot apply a bus frame (for example the store is
+unavailable), it marks the local room stale and closes its clients there with
+code `1011`. They reconnect, reload the room and resend unacknowledged outbox
+entries instead of continuing from a replica that missed a sequence.
+
+### 16.2 Snapshot-plus-replay and compaction
+
+`readRoomState()` takes `latestSnapshot(documentId)`, deserializes the full CRDT
+document, then calls `loadOperations(documentId, snapshot.seq)`. The watermark
+is `max(latestSeq, snapshot.seq)` so an empty compacted log still reports the
+correct sequence. `loadRooms()` installs every persisted document at startup;
+`loadRoom()` does the same lazily through a per-registry single-flight map, so
+concurrent joins share a load and existing members survive the install. If a
+snapshot and compaction land on another instance while a load is between its
+snapshot and log reads, `readRoomState()` notices the newer snapshot and
+repeats from it rather than accepting a hole in the log.
+
+The snapshot and its compaction run in the **same per-room write queue**:
+
+1. `snapshot()` captures `room.seq`, serializes `room.doc`, and enqueues the
+   snapshot write.
+2. After the snapshot is durable, `compactOperations(roomId, seq)` deletes only
+   rows with `seq <= captured`.
+3. Operations appended after the capture are queued after the snapshot and stay
+   in the log for the next one.
+
+Because the snapshot contains the registers, tombstones, RGA order and `seen`
+ids, replaying it is equivalent to replaying the full log. A late resend after
+compaction is rejected by the snapshot's `seen` set. The Postgres and memory
+stores implement the same contract; tests assert that snapshot+replay equals
+full-log replay before and after compaction.
+
+### 16.3 Multi-gateway lifecycle
+
+- **Bus connection precedes replay.** `index.ts` connects Redis before
+  `loadRooms()`. Frames that arrive before the WebSocket handler subscribes are
+  buffered by the bus (bounded at 1 000), then applied in order. Replaying one
+  twice is harmless.
+- **Lazy installs.** A remote gateway creates a placeholder room only for
+  presence or a bus frame; `loadRoom()` replaces it with the persisted document
+  while preserving local and remote members.
+- **Presence fan-out.** Join, heartbeat and leave publish `presence` frames.
+  The origin ignores its own echo and updates local state directly; receivers
+  add/remove `remoteMembers` and rebroadcast the merged roster with normalized
+  `lastSeen`. Remote ghosts expire through the normal sweep.
+- **Duplicate-only publications.** If every envelope is already present by the
+  time the echo reaches a gateway, it broadcasts `ops: []` at that sequence.
+  Clients advance their watermark and emit no CRDT change, so a consumed
+  global sequence cannot stall the next batch. As a backstop for a client that
+  joins after such a sequence was consumed but not persisted, the client waits
+  one second for a missing frame and then requests full state instead of
+  buffering forever.
+- **Shutdown.** Close sockets and the HTTP server, drain queued bus work, stop
+  the Redis subscriber, drain once more, flush every room's operation log and
+  snapshot/compaction queue, then close the store.
+- **Standalone mode.** Without a reachable Redis, `createRoomBus()` logs and
+  returns `null`; the gateway uses the local sequence path and `/healthz` shows
+  `bus: null`. This keeps one-command development and single-instance
+  deployments complete, but it is not a cluster.
+
+### 16.4 Deployment and scale test
+
+`Dockerfile` has a shared build stage and two runtimes: a Node gateway with the
+server and shared builds, and an Nginx image serving `client/dist`. The
+`deploy/nginx.conf` upstream uses least-connections, passive `max_fails`, and a
+long-lived WebSocket upgrade path. Compose runs `gateway-a` and `gateway-b`
+against the same Postgres and Redis, exposes them on `8101`/`8102` for health
+inspection, and serves the application through Nginx on `8080`. No sticky
+sessions are configured.
+
+`server/src/scaling.test.ts` gives two real gateway endpoints different
+instance ids on one `MemoryRoomBusHub`. It proves cross-instance edits,
+presence, one globally agreed sequence, and snapshot+replay equality after
+compaction. `scripts/scale-smoke.mjs` is the browser-level test: two gateways,
+two TCP proxies with health-based failover, two browser contexts, an edit each
+way, kill/gateway reconnect, full restart from Postgres, and a final cross-
+instance edit. CI runs it with Postgres and Redis services.
+
+### 16.5 Stage 5 checklist
+
+- [x] Accepted operations append to Postgres on every gateway
+- [x] Room-wide sequence allocated and published atomically in Redis
+- [x] Every gateway applies the echo in bus order, including the origin
+- [x] Snapshot plus later-operation replay loads a room
+- [x] Snapshot writes compact covered operation rows
+- [x] Snapshot+replay equals full-log replay after compaction
+- [x] Presence crosses instances
+- [x] Killing a gateway lets its client reconnect to the survivor
+- [x] Restarting all gateways restores the document
+- [x] Two gateways run behind Nginx in Compose
+
+---
+
+## 17. Roadmap
+
+| Stage    | Milestone                                                     | Exit criterion                            |
+| -------- | ------------------------------------------------------------- | ----------------------------------------- |
+| 0        | Monorepo, compose, CI, design doc, shared types               | CI green; compose healthy                 |
+| 1        | Canvas, transform maths, operation pipeline, undo/redo        | 500 objects at 60 fps; ops only           |
+| 2        | WS gateway, naive LWW sync                                    | Two browsers move a rect live             |
+| 3 (done) | HLC, LWW-map, RGA z-order, tombstones, convergence fuzz tests | 10 000 randomized schedules converge      |
+| 4 (done) | Presence, rooms, JWT auth, roles, Postgres log + snapshots    | 4-browser smoke; restart-safe             |
+| 5 (done) | Redis fan-out, compaction, Nginx, failover smoke              | 2 gateways; kill/restart-safe             |
+| 6        | IndexedDB outbox, optimistic apply, text RGA, version restore | Reload-safe offline edits; text converges |
+| 7        | k6 load tests, metrics, AWS deploy, CD, public demo           | p95 < 80 ms @ 200; live URL               |

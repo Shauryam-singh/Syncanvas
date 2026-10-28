@@ -37,12 +37,24 @@ export interface Room {
    * the room has seen, not on the order they arrived in.
    */
   doc: SceneDoc;
-  /** Sequence number of the last accepted batch (the broadcast watermark). */
+  /**
+   * Highest sequence number this replica has applied.
+   *
+   * With a room bus this is a gateway-independent watermark assigned by
+   * Redis; without one it is the local broadcast counter.
+   */
   seq: number;
-  /** Members keyed by session id. */
+  /** Members connected to this gateway, keyed by session id. */
   members: Map<string, RoomMember>;
+  /** Members connected to other gateways, learned through the bus. */
+  remoteMembers: Map<string, RoomMember>;
   /** Number of accepted operations since the last persisted snapshot. */
   opsSinceSnapshot: number;
+  /**
+   * False when the seed document exists only in memory. A join loads the
+   * persisted snapshot and log before accepting edits.
+   */
+  loaded: boolean;
 }
 
 export interface ApplyResult {
@@ -77,7 +89,9 @@ export class RoomRegistry {
       doc: createDoc(createInitialScene()),
       seq: 0,
       members: new Map(),
+      remoteMembers: new Map(),
       opsSinceSnapshot: 0,
+      loaded: false,
     };
     this.rooms.set(roomId, room);
     return room;
@@ -85,15 +99,19 @@ export class RoomRegistry {
 
   /**
    * Replaces (or creates) a room with a document loaded from persistence.
-   * Used on startup after replaying the operation log.
+   * Used on startup after replaying the operation log, and lazily when a
+   * client joins a room this gateway has not seen yet.
    */
   installRoom(input: { id: string; doc: SceneDoc; seq: number }): Room {
+    const existing = this.rooms.get(input.id);
     const room: Room = {
       id: input.id,
       doc: input.doc,
       seq: input.seq,
-      members: this.rooms.get(input.id)?.members ?? new Map(),
+      members: existing?.members ?? new Map(),
+      remoteMembers: existing?.remoteMembers ?? new Map(),
       opsSinceSnapshot: 0,
+      loaded: true,
     };
     this.rooms.set(input.id, room);
     return room;
@@ -114,18 +132,30 @@ export class RoomRegistry {
     return room;
   }
 
-  /** Removes a member. The room itself is kept so its state survives. */
+  /** Removes a member connected to this gateway. */
   leave(roomId: string, sessionId: string): void {
     this.rooms.get(roomId)?.members.delete(sessionId);
   }
 
-  /** Removes a session from every room it joined (used on disconnect). */
+  /** Removes a session from every room it joined locally (used on disconnect). */
   leaveAll(sessionId: string): string[] {
     const left: string[] = [];
     for (const room of this.rooms.values()) {
       if (room.members.delete(sessionId)) left.push(room.id);
     }
     return left;
+  }
+
+  /** Adds or refreshes a member learned from another gateway. */
+  upsertRemote(roomId: string, member: RoomMember): Room {
+    const room = this.ensureRoom(roomId);
+    room.remoteMembers.set(member.sessionId, member);
+    return room;
+  }
+
+  /** Removes a session that disconnected from another gateway. */
+  removeRemote(roomId: string, sessionId: string): boolean {
+    return this.rooms.get(roomId)?.remoteMembers.delete(sessionId) ?? false;
   }
 
   roleOf(roomId: string, sessionId: string): RoomRole | null {
@@ -171,9 +201,41 @@ export class RoomRegistry {
           removed = true;
         }
       }
+      // Remote members are refreshed by their owning gateway's heartbeats.
+      // If that process disappears without a leave frame, this eventually
+      // clears their cursors too.
+      for (const [sessionId, member] of room.remoteMembers) {
+        if (now - member.lastSeen > ttlMs) {
+          room.remoteMembers.delete(sessionId);
+          removed = true;
+        }
+      }
       if (removed) changed.push(room.id);
     }
     return changed;
+  }
+
+  /**
+   * Returns the operations that are new to this replica without merging them.
+   * The bus uses this to avoid allocating a sequence number for a pure resend.
+   */
+  previewOps(
+    roomId: string,
+    envelopes: readonly OpEnvelope[],
+  ): { accepted: OpEnvelope[]; duplicates: string[] } {
+    const room = this.ensureRoom(roomId);
+    const accepted: OpEnvelope[] = [];
+    const duplicates: string[] = [];
+    const inBatch = new Set<string>();
+    for (const envelope of envelopes) {
+      if (room.doc.seen.has(envelope.id) || inBatch.has(envelope.id)) {
+        duplicates.push(envelope.id);
+        continue;
+      }
+      inBatch.add(envelope.id);
+      accepted.push(envelope);
+    }
+    return { accepted, duplicates };
   }
 
   /**
@@ -184,32 +246,27 @@ export class RoomRegistry {
    * Two replicas that have seen the same operations hold the same document,
    * whatever order the gateway received them in.
    *
-   * The sequence number is still assigned per accepted batch because the wire
-   * protocol uses it for acknowledgement and catch-up — it is a broadcast
-   * watermark, not a merge rule.
+   * `seq` is supplied when a room bus assigned the room-wide watermark. A
+   * standalone gateway omits it and increments its local counter instead.
    */
-  applyOps(roomId: string, envelopes: readonly OpEnvelope[]): ApplyResult {
+  applyOps(roomId: string, envelopes: readonly OpEnvelope[], seq?: number): ApplyResult {
     const room = this.ensureRoom(roomId);
-    const accepted: OpEnvelope[] = [];
-    const duplicates: string[] = [];
-    const inBatch = new Set<string>();
-
-    for (const envelope of envelopes) {
-      if (room.doc.seen.has(envelope.id) || inBatch.has(envelope.id)) {
-        duplicates.push(envelope.id);
-        continue;
-      }
-      inBatch.add(envelope.id);
-      accepted.push(envelope);
-    }
+    const { accepted, duplicates } = this.previewOps(roomId, envelopes);
 
     if (accepted.length > 0) {
       room.doc = mergeEnvelopes(room.doc, accepted);
-      room.seq += 1;
       room.opsSinceSnapshot += accepted.length;
     }
+    if (seq === undefined) {
+      if (accepted.length > 0) room.seq += 1;
+    } else {
+      // The bus allocates a sequence for every publication, even a resend that
+      // turned out to be fully duplicate. Advancing the local watermark keeps
+      // later batches contiguous for this gateway's clients.
+      room.seq = Math.max(room.seq, seq);
+    }
 
-    return { seq: room.seq, accepted, duplicates };
+    return { seq: seq ?? room.seq, accepted, duplicates };
   }
 
   /** The room state a joining client needs: the objects and the watermark. */
@@ -225,7 +282,9 @@ export class RoomRegistry {
   peers(roomId: string): PeerPresence[] {
     const room = this.rooms.get(roomId);
     if (!room) return [];
-    return [...room.members.values()].map((member) => ({
+    const members = [...room.members.values(), ...room.remoteMembers.values()];
+    members.sort((a, b) => a.joinedAt - b.joinedAt || a.sessionId.localeCompare(b.sessionId));
+    return members.map((member) => ({
       sessionId: member.sessionId,
       userId: member.userId,
       displayName: member.displayName,

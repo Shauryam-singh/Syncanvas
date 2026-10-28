@@ -1,4 +1,4 @@
--- Syncanvas persistence schema (stage 4).
+-- Syncanvas persistence schema (stages 4-5).
 --
 -- Every statement is idempotent: the gateway runs this file on startup when a
 -- database is configured, and the migration command runs it explicitly.

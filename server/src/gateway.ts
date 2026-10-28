@@ -9,8 +9,9 @@ import {
   type ServerMessage,
 } from '@syncanvas/shared';
 import { verifyAccessToken, verifyInviteToken } from './auth/jwt.js';
+import type { BusMessage, OpsMessage, RoomBus } from './bus.js';
 import type { ServerConfig } from './config.js';
-import type { RoomPersistence } from './persistence.js';
+import { loadRoom, type RoomPersistence } from './persistence.js';
 import { RoomRegistry, type RoomMember } from './rooms.js';
 import type { DocumentRecord, Store, User } from './store/index.js';
 
@@ -58,6 +59,8 @@ export interface GatewayOptions {
     'jwtSecret' | 'publicDemoRoom' | 'maxOpsPerBatch' | 'presenceTtlMs' | 'presenceSweepMs'
   >;
   persistence?: RoomPersistence;
+  /** Redis (or in-memory test) fan-out. Omit for a standalone gateway. */
+  bus?: RoomBus;
   logger?: Pick<Console, 'error' | 'warn'>;
 }
 
@@ -77,9 +80,9 @@ export interface GatewayOptions {
 export function createGateway(
   server: HttpServer,
   options: GatewayOptions,
-): { wss: WebSocketServer; registry: RoomRegistry } {
+): { wss: WebSocketServer; registry: RoomRegistry; drain: () => Promise<void> } {
   const registry = options.registry ?? new RoomRegistry();
-  const { store, config } = options;
+  const { store, config, bus } = options;
   const persistence = options.persistence;
   const logger = options.logger ?? console;
   const wss = new WebSocketServer({
@@ -88,6 +91,7 @@ export function createGateway(
     maxPayload: 1_000_000,
   });
   const clients = new Map<string, Client>();
+  const busQueues = new Map<string, Promise<void>>();
   let colorCursor = 0;
 
   function send(client: Client, message: ServerMessage): void {
@@ -125,6 +129,54 @@ export function createGateway(
   function broadcastPeers(roomId: string): void {
     if (!registry.room(roomId)) return;
     broadcast(roomId, { t: 'presence', roomId, peers: registry.peers(roomId) });
+  }
+
+  function sendState(client: Client, roomId: string): void {
+    const snapshot = registry.snapshot(roomId);
+    send(client, {
+      t: 'state',
+      roomId,
+      snapshotSeq: snapshot.snapshotSeq,
+      objects: snapshot.objects,
+      ops: [],
+    });
+  }
+
+  /** Publishes ephemeral presence to the other gateways, if any. */
+  function publishPresence(roomId: string, member: RoomMember): void {
+    if (!bus) return;
+    void bus.publishPresence(roomId, member.sessionId, member).catch((error: unknown) => {
+      logger.warn(`Could not publish presence for room ${roomId}:`, error);
+    });
+  }
+
+  function publishPresenceLeave(roomId: string, sessionId: string): void {
+    if (!bus) return;
+    void bus.publishPresence(roomId, sessionId, null).catch((error: unknown) => {
+      logger.warn(`Could not publish presence leave for room ${roomId}:`, error);
+    });
+  }
+
+  /**
+   * Serializes bus work per room. Redis publishes in order, but loading a room
+   * is async; without this queue two batches could apply out of order while
+   * their snapshot load is in flight.
+   */
+  function enqueueBus(roomId: string, task: () => Promise<void>): void {
+    const previous = busQueues.get(roomId) ?? Promise.resolve();
+    const next = previous.then(task).catch((error: unknown) => {
+      logger.error(`Room-bus work for ${roomId} failed:`, error);
+    });
+    busQueues.set(roomId, next);
+    void next.finally(() => {
+      if (busQueues.get(roomId) === next) busQueues.delete(roomId);
+    });
+  }
+
+  async function drain(): Promise<void> {
+    while (busQueues.size > 0) {
+      await Promise.all([...busQueues.values()]);
+    }
   }
 
   /** Builds the presence record for a connection that just joined. */
@@ -264,8 +316,17 @@ export function createGateway(
       return;
     }
 
-    const room = registry.room(roomId) ?? registry.ensureRoom(roomId);
-    registry.join(roomId, memberOf(client, access.role));
+    let room;
+    try {
+      room = await loadRoom(store, registry, roomId);
+    } catch (error) {
+      logger.error(`Could not load room ${roomId}:`, error);
+      sendError(client, 'internal', 'Could not load that room.', { roomId });
+      return;
+    }
+
+    const member = memberOf(client, access.role);
+    registry.join(roomId, member);
     client.rooms.add(roomId);
 
     send(client, {
@@ -276,18 +337,16 @@ export function createGateway(
       snapshotSeq: room.seq,
       peers: registry.peers(roomId),
     });
-    const snapshot = registry.snapshot(roomId);
-    send(client, {
-      t: 'state',
-      roomId,
-      snapshotSeq: snapshot.snapshotSeq,
-      objects: snapshot.objects,
-      ops: [],
-    });
+    sendState(client, roomId);
     broadcastPeers(roomId);
+    publishPresence(roomId, member);
   }
 
-  function handleOps(client: Client, roomId: string, envelopes: readonly OpEnvelope[]): void {
+  async function handleOps(
+    client: Client,
+    roomId: string,
+    envelopes: readonly OpEnvelope[],
+  ): Promise<void> {
     if (envelopes.length === 0) return;
 
     const role = registry.roleOf(roomId, client.id);
@@ -323,6 +382,47 @@ export function createGateway(
       hlc: { ...envelope.hlc, actorId: client.userId as string },
     }));
 
+    const room = registry.ensureRoom(roomId);
+    const preview = registry.previewOps(roomId, stamped);
+
+    if (preview.accepted.length === 0) {
+      // A pure resend: acknowledge every id, then hand the author the current
+      // projection in case the original broadcast was lost.
+      send(client, {
+        t: 'ack',
+        roomId,
+        opIds: stamped.map((envelope) => envelope.id),
+        seq: room.seq,
+      });
+      sendState(client, roomId);
+      return;
+    }
+
+    if (bus) {
+      // The bus, not this process, applies and broadcasts the batch. That
+      // makes every gateway see the same order and the same room watermark.
+      try {
+        await bus.publishOps(
+          {
+            roomId,
+            sessionId: client.id,
+            ackIds: stamped.map((envelope) => envelope.id),
+            ops: preview.accepted,
+          },
+          room.seq,
+        );
+      } catch (error) {
+        logger.error(`Could not publish operations for room ${roomId}:`, error);
+        sendError(client, 'internal', 'Could not persist that edit. Retrying.', {
+          roomId,
+          opIds: stamped.map((envelope) => envelope.id),
+        });
+        // Drop the socket so the client reconnects and resends its outbox.
+        client.socket.close(1011, 'room bus unavailable');
+      }
+      return;
+    }
+
     const result = registry.applyOps(roomId, stamped);
 
     if (result.accepted.length > 0) {
@@ -346,14 +446,7 @@ export function createGateway(
       // The client re-sent something we already have — it missed the
       // broadcast (a dropped connection). Hand it the authoritative state so
       // it can catch up instead of guessing.
-      const snapshot = registry.snapshot(roomId);
-      send(client, {
-        t: 'state',
-        roomId,
-        snapshotSeq: snapshot.snapshotSeq,
-        objects: snapshot.objects,
-        ops: [],
-      });
+      sendState(client, roomId);
     }
   }
 
@@ -366,14 +459,7 @@ export function createGateway(
     const room = registry.ensureRoom(roomId);
     const known = opIds.filter((id) => room.doc.seen.has(id));
     send(client, { t: 'ack', roomId, opIds: known, seq: room.seq });
-    const snapshot = registry.snapshot(roomId);
-    send(client, {
-      t: 'state',
-      roomId,
-      snapshotSeq: snapshot.snapshotSeq,
-      objects: snapshot.objects,
-      ops: [],
-    });
+    sendState(client, roomId);
   }
 
   function handlePresence(
@@ -393,8 +479,15 @@ export function createGateway(
           y: Math.max(-MAX_CURSOR_COORDINATE, Math.min(MAX_CURSOR_COORDINATE, cursor.y)),
         }
       : null;
-    registry.updatePresence(roomId, client.id, safeCursor, selection.slice(0, 1_000), now);
+    const member = registry.updatePresence(
+      roomId,
+      client.id,
+      safeCursor,
+      selection.slice(0, 1_000),
+      now,
+    );
     broadcastPeers(roomId);
+    if (member) publishPresence(roomId, member);
   }
 
   function handleMessage(client: Client, raw: string): void {
@@ -426,11 +519,18 @@ export function createGateway(
         registry.leave(message.roomId, client.id);
         client.rooms.delete(message.roomId);
         broadcastPeers(message.roomId);
+        publishPresenceLeave(message.roomId, client.id);
         return;
       }
 
       case 'ops':
-        handleOps(client, message.roomId, message.ops);
+        void handleOps(client, message.roomId, message.ops).catch((error: unknown) => {
+          logger.error('Operation batch failed:', error);
+          sendError(client, 'internal', 'Could not apply that edit.', {
+            roomId: message.roomId,
+            opIds: message.ops.map((envelope) => envelope.id),
+          });
+        });
         return;
 
       case 'presence':
@@ -442,12 +542,90 @@ export function createGateway(
         return;
 
       case 'ping': {
-        for (const roomId of client.rooms) registry.touch(roomId, client.id);
+        for (const roomId of client.rooms) {
+          const member = registry.touch(roomId, client.id);
+          // Remote gateways use this heartbeat to keep the roster alive.
+          if (member) publishPresence(roomId, member);
+        }
         send(client, { t: 'pong' });
         return;
       }
     }
   }
+
+  async function applyBusOps(message: OpsMessage): Promise<void> {
+    const room = await loadRoom(store, registry, message.roomId);
+    const result = registry.applyOps(message.roomId, message.ops, message.seq);
+
+    if (result.accepted.length > 0) {
+      broadcast(message.roomId, {
+        t: 'ops',
+        roomId: message.roomId,
+        // `room.seq` and the bus sequence can differ only when this replica
+        // replayed the operation from Postgres before the frame arrived.
+        seq: message.seq,
+        ops: result.accepted,
+      });
+      persistence?.append(message.roomId, message.seq, result.accepted);
+    } else if (registry.room(message.roomId)?.members.size) {
+      // A fully-duplicate publication still consumes a global sequence. Send
+      // an empty frame so connected clients advance their contiguous
+      // watermark instead of waiting forever for this sequence.
+      broadcast(message.roomId, { t: 'ops', roomId: message.roomId, seq: message.seq, ops: [] });
+    }
+
+    if (message.origin !== bus?.instanceId) return;
+    const author = clients.get(message.sessionId);
+    if (!author) return;
+
+    // Broadcast before ack: the client's `mine` bookkeeping uses its outbox,
+    // so it must see its own echo while the entries are still pending.
+    send(author, {
+      t: 'ack',
+      roomId: message.roomId,
+      opIds: message.ackIds,
+      seq: message.seq,
+    });
+    if (result.duplicates.length > 0) sendState(author, message.roomId);
+
+    // Keep the local watermark honest if the room was loaded from a newer
+    // snapshot than the one this batch was allocated against.
+    if (room.seq < message.seq) room.seq = message.seq;
+  }
+
+  function onBusMessage(message: BusMessage): void {
+    if (message.t === 'presence') {
+      if (message.origin === bus?.instanceId) return;
+      if (message.member) {
+        registry.upsertRemote(message.roomId, { ...message.member, lastSeen: Date.now() });
+      } else {
+        registry.removeRemote(message.roomId, message.sessionId);
+      }
+      broadcastPeers(message.roomId);
+      return;
+    }
+
+    enqueueBus(message.roomId, async () => {
+      try {
+        await applyBusOps(message);
+      } catch (error) {
+        // A failed frame cannot be replayed from Redis. Invalidate this
+        // replica and close its clients in the room so they reconnect, load
+        // the authoritative room and resend any unacknowledged outbox
+        // entries; continuing would leave them behind the bus order.
+        const room = registry.room(message.roomId);
+        if (room) room.loaded = false;
+        for (const client of clients.values()) {
+          if (client.rooms.has(message.roomId)) {
+            client.socket.close(1011, 'room unavailable');
+          }
+        }
+        throw error;
+      }
+    });
+  }
+
+  if (bus) bus.subscribe(onBusMessage);
 
   wss.on('connection', (socket) => {
     const id = `sess_${randomUUID().slice(0, 12)}`;
@@ -479,7 +657,10 @@ export function createGateway(
       clearTimeout(client.authTimer);
       const rooms = registry.leaveAll(client.id);
       clients.delete(client.id);
-      for (const roomId of rooms) broadcastPeers(roomId);
+      for (const roomId of rooms) {
+        publishPresenceLeave(roomId, client.id);
+        broadcastPeers(roomId);
+      }
     });
 
     socket.on('error', () => {
@@ -495,5 +676,5 @@ export function createGateway(
   sweeper.unref();
   wss.on('close', () => clearInterval(sweeper));
 
-  return { wss, registry };
+  return { wss, registry, drain };
 }

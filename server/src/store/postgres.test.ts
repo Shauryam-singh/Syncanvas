@@ -150,4 +150,40 @@ suite('PostgresStore', () => {
     const rect = registry.snapshot('room_load').objects.find((object) => object.id === 'demo-rect');
     expect(rect?.x).toBe(999);
   });
+
+  it('compacts only covered operations and still rebuilds the full document', async () => {
+    const user = await store.createUser('Compact');
+    const document = await store.createDocument({
+      id: 'room_compaction',
+      name: 'Compaction room',
+      ownerId: user.id,
+    });
+
+    const writes = [11, 22, 33, 44].map((value, index) =>
+      envelope(`compact_${index + 1}`, user.id, index + 1, {
+        kind: 'setProp',
+        objectId: 'demo-rect',
+        prop: 'x',
+        value,
+      }),
+    );
+    const fullDoc = mergeEnvelopes(createDoc(createInitialScene()), writes);
+    const prefixDoc = mergeEnvelopes(createDoc(createInitialScene()), writes.slice(0, 2));
+
+    await store.saveSnapshot(document.id, 2, serializeDoc(prefixDoc));
+    for (const [index, write] of writes.entries()) {
+      await store.appendOperations(document.id, index + 1, [write]);
+    }
+
+    expect(await store.compactOperations(document.id, 2)).toBe(2);
+    expect((await store.loadOperations(document.id, 0)).map((op) => op.id)).toEqual([
+      'compact_3',
+      'compact_4',
+    ]);
+
+    const registry = new RoomRegistry();
+    await loadRooms(store, registry);
+    expect(serializeDoc(registry.room(document.id)!.doc)).toEqual(serializeDoc(fullDoc));
+    expect(registry.room(document.id)?.seq).toBe(4);
+  });
 });

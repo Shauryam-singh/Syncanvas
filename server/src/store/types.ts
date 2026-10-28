@@ -64,6 +64,11 @@ export interface Store {
 
   saveSnapshot(documentId: string, seq: number, doc: SerializedDoc): Promise<void>;
   latestSnapshot(documentId: string): Promise<SnapshotRecord | null>;
+  /**
+   * Drops log entries already covered by a snapshot. Snapshots stay additive;
+   * deleting the operations they subsume is what keeps the log bounded.
+   */
+  compactOperations(documentId: string, throughSeq: number): Promise<number>;
 
   close(): Promise<void>;
 }

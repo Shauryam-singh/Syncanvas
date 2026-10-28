@@ -21,6 +21,9 @@ export interface ApiOptions {
     ServerConfig,
     'jwtSecret' | 'jwtTtlSeconds' | 'inviteTtlSeconds' | 'publicDemoRoom' | 'corsOrigin'
   >;
+  /** Reported by `/healthz` so a scaled deployment is observable. */
+  busKind?: 'redis' | 'memory' | null;
+  instanceId?: string;
   logger?: Pick<Console, 'error'>;
 }
 
@@ -259,7 +262,18 @@ export function createApiHandler(
     }
 
     if (method === 'GET' && url.pathname === '/healthz') {
-      sendJson(res, 200, { status: 'ok', uptime: process.uptime(), store: store.kind }, origin);
+      sendJson(
+        res,
+        200,
+        {
+          status: 'ok',
+          uptime: process.uptime(),
+          store: store.kind,
+          bus: options.busKind ?? null,
+          instance: options.instanceId ?? null,
+        },
+        origin,
+      );
       return;
     }
 

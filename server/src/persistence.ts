@@ -8,20 +8,30 @@ import {
   type OpEnvelope,
   type SceneDoc,
 } from '@syncanvas/shared';
-import type { RoomRegistry } from './rooms.js';
+import type { Room, RoomRegistry } from './rooms.js';
 import type { Store } from './store/types.js';
 
+interface RoomState {
+  doc: SceneDoc;
+  seq: number;
+}
+
 /**
- * Rebuilds every persisted room before the gateway starts accepting clients.
+ * Rebuilds a room from the newest snapshot plus the operations after it.
  *
  * A snapshot carries the whole CRDT document (registers, tombstones, RGA order
  * and seen ids), so reloading from it is equivalent to never having stopped.
  * Only operations after its watermark are replayed. If the snapshot is missing
  * or unreadable, the gateway falls back to the seeded scene plus the full log.
+ *
+ * Another instance may snapshot and compact while this read is in flight. If a
+ * newer snapshot appears after the operation query, rows between the two
+ * watermarks may already have been deleted; reload from the newer snapshot
+ * instead of silently dropping that range.
  */
-export async function loadRooms(store: Store, registry: RoomRegistry): Promise<void> {
-  for (const document of await store.allDocuments()) {
-    const snapshot = await store.latestSnapshot(document.id);
+async function readRoomState(store: Store, documentId: string): Promise<RoomState> {
+  for (;;) {
+    const snapshot = await store.latestSnapshot(documentId);
     let doc: SceneDoc = createDoc(createInitialScene());
     let replayFrom = 0;
     if (snapshot) {
@@ -32,13 +42,60 @@ export async function loadRooms(store: Store, registry: RoomRegistry): Promise<v
         // Ignore a corrupt snapshot and replay the log; state is never guessed.
       }
     }
-    const operations = await store.loadOperations(document.id, replayFrom);
+    const operations = await store.loadOperations(documentId, replayFrom);
+    const newest = await store.latestSnapshot(documentId);
+    if ((newest?.seq ?? 0) > (snapshot?.seq ?? 0)) continue;
     if (operations.length > 0) doc = mergeEnvelopes(doc, operations);
-    // A snapshot from an older release may still contain a retired seed
-    // object. Drop it only while it is untouched; edited objects are user data.
+    // A snapshot from an older release may still contain a retired seed object.
+    // Drop it only while it is untouched; edited objects are user data.
     doc = pruneRetiredSeeds(doc);
-    const seq = Math.max(await store.latestSeq(document.id), snapshot?.seq ?? 0);
+    const seq = Math.max(await store.latestSeq(documentId), snapshot?.seq ?? 0);
+    return { doc, seq };
+  }
+}
+
+/** Rebuilds every persisted room before the gateway starts accepting clients. */
+export async function loadRooms(store: Store, registry: RoomRegistry): Promise<void> {
+  for (const document of await store.allDocuments()) {
+    const { doc, seq } = await readRoomState(store, document.id);
     registry.installRoom({ id: document.id, doc, seq });
+  }
+}
+
+const pendingLoads = new WeakMap<RoomRegistry, Map<string, Promise<Room>>>();
+
+/**
+ * Loads a room on first use.
+ *
+ * Every gateway has its own in-memory registry. Rooms created after a gateway
+ * booted, or rooms this instance never hosted before, have to be read from the
+ * snapshot/log before the first client can see them. Concurrent joins share
+ * one load, and existing presence entries survive the install.
+ */
+export async function loadRoom(
+  store: Store,
+  registry: RoomRegistry,
+  roomId: string,
+): Promise<Room> {
+  const existing = registry.room(roomId);
+  if (existing?.loaded) return existing;
+
+  let loads = pendingLoads.get(registry);
+  if (!loads) {
+    loads = new Map();
+    pendingLoads.set(registry, loads);
+  }
+  const pending = loads.get(roomId);
+  if (pending) return pending;
+
+  const loading = readRoomState(store, roomId).then(({ doc, seq }) =>
+    registry.installRoom({ id: roomId, doc, seq }),
+  );
+  loads.set(roomId, loading);
+  try {
+    return await loading;
+  } finally {
+    if (loads.get(roomId) === loading) loads.delete(roomId);
   }
 }
 
@@ -58,8 +115,14 @@ export async function ensureDemoRoom(
   if (!roomId) return;
   const existing = await store.document(roomId);
   if (!existing) {
-    const owner = await store.createUser('Syncanvas demo');
-    await store.createDocument({ id: roomId, name, ownerId: owner.id });
+    try {
+      const owner = await store.createUser('Syncanvas demo');
+      await store.createDocument({ id: roomId, name, ownerId: owner.id });
+    } catch (error) {
+      // Two gateways booting against the same fresh database can race to seed
+      // the sandbox. The loser re-reads instead of failing to start.
+      if (!(await store.document(roomId))) throw error;
+    }
   }
   registry.ensureRoom(roomId);
 }
@@ -81,8 +144,14 @@ interface RoomStats {
  * Writes the operation log and snapshots behind the live merge.
  *
  * Every room has its own serial queue, so a snapshot can never overtake the
- * operations it claims to cover. Failures are logged and dropped: a database
- * hiccup must not take the realtime room down.
+ * operations it claims to cover, and compaction can never delete an operation
+ * that the snapshot does not include. Failures are logged and dropped: a
+ * database hiccup must not take the realtime room down.
+ *
+ * In a clustered deployment every instance receives every accepted batch, so
+ * more than one gateway may append the same operation. The `(document_id,
+ * op_id)` key makes that idempotent; the redundant write is the price of not
+ * making durability depend on one process surviving.
  */
 export class RoomPersistence {
   private readonly stats = new Map<string, RoomStats>();
@@ -120,14 +189,21 @@ export class RoomPersistence {
     }
   }
 
-  /** Captures the whole CRDT document, tagged with the room watermark. */
+  /**
+   * Captures the whole CRDT document, tagged with the room watermark, then
+   * drops the log entries that snapshot subsumes.
+   */
   snapshot(roomId: string): void {
     const room = this.registry.room(roomId);
     if (!room) return;
     // Capture now: the queue may run later, after more operations are merged.
     const seq = room.seq;
     const doc = serializeDoc(room.doc);
-    this.enqueue(roomId, () => this.store.saveSnapshot(roomId, seq, doc));
+    this.enqueue(roomId, async () => {
+      await this.store.saveSnapshot(roomId, seq, doc);
+      await this.store.compactOperations(roomId, seq);
+    });
+    room.opsSinceSnapshot = 0;
     this.stats.set(roomId, { operations: 0, lastSnapshotAt: Date.now() });
   }
 

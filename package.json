@@ -22,6 +22,9 @@
     "test": "npm run test --workspaces --if-present",
     "smoke": "node scripts/smoke.mjs",
     "smoke:sync": "node scripts/sync-smoke.mjs",
+    "smoke:scale": "node scripts/scale-smoke.mjs",
+    "scale:up": "docker compose --profile scale up --build -d",
+    "scale:down": "docker compose --profile scale down",
     "check": "npm run lint && npm run format:check && npm run typecheck && npm run test"
   },
   "devDependencies": {

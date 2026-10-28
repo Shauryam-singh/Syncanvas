@@ -22,6 +22,14 @@ export interface ServerConfig {
   /** Where users, rooms, operations and snapshots live. */
   storeMode: StoreMode;
   databaseUrl: string;
+  /** Cross-instance room bus. Empty keeps the gateway standalone. */
+  redisUrl: string;
+  /** Name for this process on the room bus; generated when omitted. */
+  instanceId: string;
+  /** Operations between snapshots. */
+  snapshotEvery: number;
+  /** Maximum age of a snapshot on an active room. */
+  snapshotIntervalMs: number;
   /** HS256 secret shared by access tokens and share links. */
   jwtSecret: string;
   /** Lifetime of an access token (a guest session). */
@@ -46,6 +54,10 @@ export const config: ServerConfig = {
   wsPath: process.env.WS_PATH ?? '/ws',
   storeMode: storeMode(),
   databaseUrl: required('DATABASE_URL', 'postgres://syncanvas:syncanvas@localhost:5432/syncanvas'),
+  redisUrl: process.env.REDIS_URL?.trim() ?? '',
+  instanceId: process.env.INSTANCE_ID?.trim() ?? '',
+  snapshotEvery: Number(process.env.SNAPSHOT_EVERY ?? 100),
+  snapshotIntervalMs: Number(process.env.SNAPSHOT_INTERVAL_MS ?? 60_000),
   jwtSecret: required('JWT_SECRET', 'dev-only-secret'),
   jwtTtlSeconds: Number(process.env.JWT_TTL_SECONDS ?? 7 * 24 * 60 * 60),
   inviteTtlSeconds: Number(process.env.INVITE_TTL_SECONDS ?? 7 * 24 * 60 * 60),

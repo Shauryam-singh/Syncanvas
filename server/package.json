@@ -15,6 +15,7 @@
   "dependencies": {
     "@syncanvas/shared": "*",
     "pg": "^8.23.1",
+    "redis": "^6.3.0",
     "ws": "^8.18.3"
   },
   "devDependencies": {

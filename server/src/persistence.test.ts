@@ -4,6 +4,7 @@ import {
   createInitialScene,
   createSceneObject,
   deserializeDoc,
+  mergeEnvelopes,
   serializeDoc,
   toSceneState,
   type Op,
@@ -72,7 +73,7 @@ describe('room persistence', () => {
     expect(ids).toContain('demo-rect');
   });
 
-  it('writes accepted operations and flushes a snapshot', async () => {
+  it('writes accepted operations, then snapshots and compacts them on flush', async () => {
     const store = new MemoryStore();
     const user = await store.createUser('Ada');
     await store.createDocument({ id: 'room_flush', name: 'Flush', ownerId: user.id });
@@ -91,8 +92,9 @@ describe('room persistence', () => {
     persistence.append('room_flush', result.seq, result.accepted);
     await persistence.flush();
 
+    // The snapshot subsumes the only operation, so compaction removes it.
     const operations = await store.loadOperations('room_flush', 0);
-    expect(operations.map((op) => op.id)).toEqual(['op_1']);
+    expect(operations).toEqual([]);
     const snapshot = await store.latestSnapshot('room_flush');
     expect(snapshot?.seq).toBe(1);
     expect(snapshot).not.toBeNull();
@@ -105,6 +107,84 @@ describe('room persistence', () => {
     expect(
       restored.snapshot('room_flush').objects.find((object) => object.id === 'demo-rect')?.x,
     ).toBe(321);
+  });
+
+  it('compacts only the log entries a snapshot covers, without changing state', async () => {
+    const store = new MemoryStore();
+    const user = await store.createUser('Ada');
+    await store.createDocument({ id: 'room_compact', name: 'Compact', ownerId: user.id });
+
+    const writes = [11, 22, 33, 44].map((value, index) =>
+      envelope(`op_${index + 1}`, user.id, index + 1, {
+        kind: 'setProp',
+        objectId: 'demo-rect',
+        prop: 'x',
+        value,
+      }),
+    );
+    const fullDoc = mergeEnvelopes(createDoc(createInitialScene()), writes);
+
+    // A snapshot after the first two writes. The remaining two must stay in
+    // the log so replay can reach the full document.
+    const prefixDoc = mergeEnvelopes(createDoc(createInitialScene()), writes.slice(0, 2));
+    await store.saveSnapshot('room_compact', 2, serializeDoc(prefixDoc));
+    // appendOperations is async; let the four writes land before compacting.
+    await Promise.all([
+      store.appendOperations('room_compact', 1, [writes[0] as OpEnvelope]),
+      store.appendOperations('room_compact', 2, [writes[1] as OpEnvelope]),
+      store.appendOperations('room_compact', 3, [writes[2] as OpEnvelope]),
+      store.appendOperations('room_compact', 4, [writes[3] as OpEnvelope]),
+    ]);
+
+    const removed = await store.compactOperations('room_compact', 2);
+    expect(removed).toBe(2);
+    const remaining = await store.loadOperations('room_compact', 0);
+    expect(remaining.map((operation) => operation.id)).toEqual(['op_3', 'op_4']);
+
+    const replayed = new RoomRegistry();
+    await loadRooms(store, replayed);
+    expect(serializeDoc(replayed.room('room_compact')!.doc)).toEqual(serializeDoc(fullDoc));
+  });
+
+  it('retries when another gateway compacts between the snapshot and log reads', async () => {
+    // Simulate the first read racing a compaction on another instance: it
+    // sees no snapshot, and by the time it queries the log, the rows it needs
+    // have been deleted. The newer snapshot only becomes visible afterwards.
+    class RacingStore extends MemoryStore {
+      private raced = false;
+
+      override async latestSnapshot(documentId: string) {
+        if (!this.raced) return null;
+        return super.latestSnapshot(documentId);
+      }
+
+      override async loadOperations(documentId: string, afterSeq: number) {
+        if (!this.raced) {
+          this.raced = true;
+          return [];
+        }
+        return super.loadOperations(documentId, afterSeq);
+      }
+    }
+
+    const store = new RacingStore();
+    const user = await store.createUser('Ada');
+    await store.createDocument({ id: 'room_race', name: 'Race', ownerId: user.id });
+    const doc = mergeEnvelopes(createDoc(createInitialScene()), [
+      envelope('op_race', user.id, 10, {
+        kind: 'setProp',
+        objectId: 'demo-rect',
+        prop: 'x',
+        value: 777,
+      }),
+    ]);
+    await store.saveSnapshot('room_race', 1, serializeDoc(doc));
+
+    const registry = new RoomRegistry();
+    await loadRooms(store, registry);
+    expect(
+      registry.snapshot('room_race').objects.find((object) => object.id === 'demo-rect')?.x,
+    ).toBe(777);
   });
 
   it('rejects a resend that predates the snapshot after a restart', async () => {

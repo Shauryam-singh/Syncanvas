@@ -145,7 +145,20 @@ export class MemoryStore implements Store {
 
   async latestSnapshot(documentId: string): Promise<SnapshotRecord | null> {
     const snapshots = this.snapshots.get(documentId) ?? [];
-    return snapshots[snapshots.length - 1] ?? null;
+    // Concurrent gateways can save snapshots out of order; the watermark, not
+    // insertion order, decides which one is newest.
+    return snapshots.reduce<SnapshotRecord | null>(
+      (latest, snapshot) => (!latest || snapshot.seq >= latest.seq ? snapshot : latest),
+      null,
+    );
+  }
+
+  async compactOperations(documentId: string, throughSeq: number): Promise<number> {
+    const stored = this.ops.get(documentId) ?? [];
+    const kept = stored.filter((entry) => entry.seq > throughSeq);
+    const removed = stored.length - kept.length;
+    this.ops.set(documentId, kept);
+    return removed;
   }
 
   async close(): Promise<void> {

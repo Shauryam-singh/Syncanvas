@@ -66,6 +66,16 @@ const PRESENCE_INTERVAL_MS = 40;
 /** Keeps presence alive when the user is idle. */
 const HEARTBEAT_INTERVAL_MS = 20_000;
 
+/**
+ * How long to wait for a missing sequence before asking for full state.
+ *
+ * A gap can be legitimate — a duplicate-only publication consumes a sequence
+ * but has no operations, and a gateway that was not holding the room may not
+ * have persisted that watermark. It is also how a genuinely lost frame looks,
+ * so the safe answer is a state resync rather than guessing.
+ */
+const GAP_RESYNC_MS = 1_000;
+
 interface OutboxEntry {
   envelope: OpEnvelope;
   undoable: boolean;
@@ -98,6 +108,7 @@ export class SyncClient {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private heartbeat: ReturnType<typeof setInterval> | null = null;
   private presenceTimer: ReturnType<typeof setTimeout> | null = null;
+  private gapTimer: ReturnType<typeof setTimeout> | null = null;
   private attempts = 0;
   private clock: HlcTimestamp;
   private userId: string | null = null;
@@ -157,6 +168,7 @@ export class SyncClient {
       // Sequence numbers are per connection: anything buffered from the old
       // socket must never be spliced into the new connection's stream.
       this.pending.clear();
+      this.clearGapTimer();
       this.stopHeartbeat();
       if (this.closed) return;
       this.needsResync = true;
@@ -286,7 +298,27 @@ export class SyncClient {
       clearTimeout(this.presenceTimer);
       this.presenceTimer = null;
     }
+    this.clearGapTimer();
     this.stopHeartbeat();
+  }
+
+  private clearGapTimer(): void {
+    if (!this.gapTimer) return;
+    clearTimeout(this.gapTimer);
+    this.gapTimer = null;
+  }
+
+  /** A gap is harmless if the missing frame is already in flight; wait first. */
+  private scheduleGapResync(): void {
+    if (!this.joined || this.awaitingResync || this.gapTimer) return;
+    const timer = setTimeout(() => {
+      this.gapTimer = null;
+      if (this.joined && this.pending.size > 0 && !this.pending.has(this.lastSeq + 1)) {
+        this.requestResync();
+      }
+    }, GAP_RESYNC_MS);
+    (timer as unknown as { unref?: () => void }).unref?.();
+    this.gapTimer = timer;
   }
 
   private startHeartbeat(): void {
@@ -354,6 +386,7 @@ export class SyncClient {
         this.joined = true;
         this.role = message.role;
         this.lastSeq = message.snapshotSeq;
+        this.clearGapTimer();
         this.startHeartbeat();
         this.setConnection('live');
         this.options.onJoined?.({
@@ -452,6 +485,11 @@ export class SyncClient {
       this.pending.delete(this.lastSeq + 1);
       this.lastSeq += 1;
       this.emitOps(next);
+    }
+    if (this.pending.size > 0 && !this.pending.has(this.lastSeq + 1)) {
+      this.scheduleGapResync();
+    } else {
+      this.clearGapTimer();
     }
   }
 

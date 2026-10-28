@@ -6,23 +6,28 @@ cursors, selection highlights and access-controlled rooms. The merge logic
 (LWW-map CRDT + RGA + hybrid logical clocks) is implemented from scratch, not
 wrapped around Yjs.
 
-**Status: Stage 4 — a usable multi-user product.** Guests sign in without a
-password, create rooms, and share editor or viewer links. The gateway
-authenticates every socket, enforces roles, fans out ephemeral presence, and
-persists accepted operations to Postgres. A room survives a gateway restart;
-a viewer cannot edit on the server even if the client UI is bypassed.
+**Status: Stage 5 — durable, horizontally scaled collaboration.** Guests sign
+in without a password, create rooms, and share editor or viewer links. The
+gateway authenticates every socket, enforces roles, fans out ephemeral presence,
+and persists accepted operations to Postgres. Rooms load from the newest
+full-CRDT snapshot plus the operations after it, and covered log rows are
+compacted. Two or more gateways share rooms through Redis pub/sub: Redis assigns
+the room-wide sequence and publishes each accepted batch, every gateway applies
+that order, and Nginx balances browsers across instances. A client can lose its
+gateway and reconnect to another without losing the scene; restarting every
+gateway restores the room from Postgres.
 
 ## Progress
 
-| Stage | Scope                                             | Status |
-| ----- | ------------------------------------------------- | ------ |
-| 0     | Monorepo, compose, CI, design doc                 | ✅     |
-| 1     | Canvas, transform maths, op pipeline              | ✅     |
-| 2     | WebSocket gateway, naive LWW sync                 | ✅     |
-| 3     | CRDT core (LWW-map, RGA, tombstones), fuzz        | ✅     |
-| 4     | Presence, rooms, guest auth, roles, Postgres      | ✅     |
-| 5     | Durable offline outbox, text RGA, version restore | ⬜     |
-| 6     | Redis fan-out, Docker deploy, load tests          | ⬜     |
+| Stage | Scope                                            | Status |
+| ----- | ------------------------------------------------ | ------ |
+| 0     | Monorepo, compose, CI, design doc                | ✅     |
+| 1     | Canvas, transform maths, op pipeline             | ✅     |
+| 2     | WebSocket gateway, naive LWW sync                | ✅     |
+| 3     | CRDT core (LWW-map, RGA, tombstones), fuzz       | ✅     |
+| 4     | Presence, rooms, guest auth, roles, Postgres     | ✅     |
+| 5     | Redis fan-out, snapshot compaction, 2+ gateways  | ✅     |
+| 6     | Offline outbox, optimistic apply, text RGA, load | ⬜     |
 
 ## Stage 4 checklist
 
@@ -38,6 +43,20 @@ a viewer cannot edit on the server even if the client UI is bypassed.
 - [x] Guests can choose or change their display name, and signing out leaves the room
 - [x] Durable rooms: the latest snapshot plus later operations survive a restart
 
+## Stage 5 checklist
+
+- [x] Accepted operations append to the Postgres log on every gateway
+- [x] Periodic full-CRDT snapshots, tagged with the room-wide `seq`
+- [x] Operation-log compaction below the newest snapshot
+- [x] Rooms load from the newest snapshot and replay only later operations
+- [x] Redis assigns a room-wide sequence and publishes batches atomically
+- [x] Every gateway applies bus messages in the same global order, including
+      its own echo
+- [x] Cross-instance presence, not just document edits
+- [x] Lazy room loading on first join or first bus activity
+- [x] Two gateways behind Nginx, with client reconnect after one is killed
+- [x] Restarting both gateways restores the same scene from Postgres
+
 Stage 1–3 remain complete: the canvas has rect/ellipse/line/text, drag, resize,
 rotate and z-order; every edit is an operation; the gateway and every client
 merge through the same CRDT; 10,000 randomized delivery schedules converge.
@@ -45,9 +64,10 @@ merge through the same CRDT; 10,000 randomized delivery schedules converge.
 ## How it works
 
 ```
-pointer event ──► canvas ──► store ──► outbox ──► gateway ──► room.mergeEnvelopes()
-                       ▲                                │
-                       └────── echo (same envelopes) ◄──┘
+pointer event ──► canvas ──► store ──► outbox ──► gateway ──► Redis seq + publish
+                                                         │
+                          every gateway merges the echo ─┘
+                          and broadcasts to its clients
 ```
 
 - **Every edit is an operation.** A gesture becomes a `createObject`,
@@ -55,16 +75,22 @@ pointer event ──► canvas ──► store ──► outbox ──► gatewa
 - **Conflicts resolve by version, not arrival order.** Each envelope carries an
   HLC and an operation id; the LWW register picks the maximum
   `(wall, counter, actorId, opId)`. The z-order is an RGA.
-- **The gateway is a relay and a replica.** It merges the same code path as the
-  browser, assigns a broadcast watermark (`seq`) and fans the batch out to the
-  author as well.
+- **Redis is the ordering point for the wire, not the merge.** A Lua script
+  allocates the next room-wide `seq` and publishes the batch in one atomic
+  operation. Every gateway, including the author's, applies the same bus order;
+  the CRDT still decides conflicting values. This removes the race where two
+  instances allocate sequence numbers separately.
+- **Every gateway is a replica and a writer.** A gateway appends every accepted
+  batch it sees to Postgres. The `(document_id, op_id)` key makes the duplicate
+  writes from multiple instances idempotent.
 - **No optimistic apply.** In live mode the author waits for the echo, so the
   rendered scene is always a prefix of the replicated document. Local-first
-  apply is Stage 5.
+  apply remains Stage 6 work.
 - **Reconnects are catch-up, not replay of history.** A client sends
   `sync {snapshotSeq, opIds}`; the gateway acknowledges what it already has and
   sends the current projection plus later operations. Unacknowledged outbox
-  entries are re-sent (deduped by operation id).
+  entries are re-sent (deduped by operation id). A reconnect can land on any
+  instance because every instance can load the room from Postgres.
 
 See [docs/DESIGN.md](docs/DESIGN.md) for the CRDT semantics, protocol, schema,
 presence model and tradeoffs.
@@ -96,7 +122,7 @@ creating another guest in the same room.
   Set `PUBLIC_DEMO_ROOM=` to disable it.
 - A guest identity is device-scoped. Clearing browser storage creates a new
   guest; memberships are lost, but a share link still gets you back in. Durable
-  identity (email/OAuth) is not part of Stage 4.
+  identity (email/OAuth) is not part of the current product.
 
 ### HTTP API
 
@@ -108,7 +134,7 @@ creating another guest in the same room.
 | `GET`  | `/api/rooms`             | List the caller's rooms             |
 | `GET`  | `/api/rooms/:id`         | Fetch a room if the caller can read |
 | `POST` | `/api/rooms/:id/invites` | Mint an editor/viewer link          |
-| `GET`  | `/healthz`               | Health and the active store kind    |
+| `GET`  | `/healthz`               | Store, bus kind and instance id     |
 
 The API uses Bearer auth and CORS, rejects bodies over 64 KiB, and returns JSON
 errors with stable codes.
@@ -121,13 +147,16 @@ tabs with the same user do not collide. The client throttles updates to 25 Hz
 `requestAnimationFrame`. The server forwards presence at most every 15 ms,
 clamps cursor coordinates to ±100 000, caps selections at 1 000 ids, and drops
 stale sessions after 60 s (swept every 5 s). Disconnects remove the session
-immediately. Nothing in this path touches Postgres.
+immediately. With Redis, the same presence frames are published on the room bus,
+so a gateway merges local members with members owned by other instances and
+sends one roster to each client. Presence still never touches Postgres.
 
 ## Persistence
 
 The gateway chooses a store at startup: `STORE=auto` uses Postgres when
 `DATABASE_URL` is reachable and falls back to the in-memory store; `STORE=memory`
-and `STORE=postgres` force one. The health endpoint reports which one is active.
+and `STORE=postgres` force one. The health endpoint reports the active store,
+whether Redis fan-out is connected, and this instance's bus name.
 
 ```sql
 users(id, display_name, created_at)
@@ -138,14 +167,25 @@ snapshots(id, document_id, seq, state, created_at)
 ```
 
 - Accepted operation envelopes are appended with a per-room serial write queue.
-- A snapshot is written every 100 operations or 60 s of activity. It stores the
-  **full CRDT document** — registers, tombstones, RGA order and seen operation
-  ids — not just the visible scene.
+  In a clustered deployment every gateway receives the same bus frames, so
+  several instances may append the same row; the primary key makes it a no-op.
+- A snapshot is written every **100 operations** or **60 s** of activity (both
+  configurable). It stores the **full CRDT document** — registers, tombstones,
+  RGA order and seen operation ids — not just the visible scene.
+- After a snapshot is durably written, operations with `seq <= snapshot.seq` are
+  deleted. The snapshot carries the state those rows produced, so compaction
+  cannot change a later replay. Rows after the watermark remain until the next
+  snapshot.
 - Loading a room takes the newest snapshot and replays only the operations after
   its `seq`; if there is no snapshot, it replays the log over the seed scene.
   The CRDT merge makes replay order-independent, and the persisted `seen` set
   makes a late resend a no-op instead of an overwrite.
-- Shutdown flushes pending writes before releasing the pool.
+- Rooms load lazily on first join or first bus activity on an instance, so a
+  gateway does not need a full copy of every room up front. Startup still
+  installs the rooms that already exist, which keeps single-instance boot
+  behavior unchanged.
+- Shutdown drains bus work, stops the bus subscriber, flushes pending operations
+  and snapshots, then releases the store pool.
 - `npm run migrate -w @syncanvas/server` applies the idempotent schema; the
   gateway also applies it on startup.
 - The memory store is for development and tests. It is intentionally ephemeral:
@@ -169,10 +209,16 @@ snapshots(id, document_id, seq, state, created_at)
 - `client/src/components/RoomPanel.tsx` — room/role UI, share links, sign out.
 - `server/src/auth/jwt.ts` — dependency-free HS256 access and invite tokens.
 - `server/src/http.ts` — guest auth, rooms, invites, CORS, health.
+- `server/src/bus.ts` — Redis room bus: atomic sequence+publish, presence
+  fan-out, in-process bus used by tests.
 - `server/src/gateway.ts` — socket auth, access control, presence, operation
-  admission, viewer rejection and auth-failure close.
+  admission, viewer rejection, bus echo application and ack ordering.
 - `server/src/store/` — `Store` interface, memory and Postgres implementations.
-- `server/src/persistence.ts` — room loading, snapshots, write queues, flush.
+- `server/src/persistence.ts` — lazy room loading, snapshots, compaction, write
+  queues, flush.
+- `scripts/scale-smoke.mjs` — two gateways behind failover proxies.
+- `deploy/nginx.conf`, `Dockerfile`, `docker-compose.yml` — local scaled
+  deployment (two gateways plus Nginx).
 
 ## Getting started
 
@@ -180,13 +226,16 @@ Prerequisites: Node.js ≥ 22, npm ≥ 10, Docker with Compose.
 
 ```bash
 npm install
-docker compose up -d        # Postgres :5432 (Redis is reserved for Stage 6)
+docker compose up -d        # Postgres :5432 and Redis :6379
 cp .env.example .env
 npm run dev                 # shared (tsc watch) + server :8080 + client :5173
 ```
 
 `JWT_SECRET` must be changed before exposing the gateway. If Postgres is not
-running, the gateway logs the fallback and uses the memory store.
+running, the gateway logs the fallback and uses the memory store. Redis is
+optional: without `REDIS_URL` one gateway still runs as a complete standalone
+deployment. `/healthz` reports `bus: "redis"` and the `instance` name when the
+cluster bus is active.
 
 Verify:
 
@@ -194,6 +243,7 @@ Verify:
 npm run check               # lint + format + typecheck + all tests
 npm run smoke               # single-user browser checks (client server running)
 npm run smoke:sync          # four-browser multi-user checks (starts the gateway)
+npm run smoke:scale         # two gateways, Redis, failover and full restart
 curl http://localhost:8080/healthz
 ```
 
@@ -201,6 +251,49 @@ curl http://localhost:8080/healthz
 `:5173`. It prints the store it found. With Postgres it also checks that the
 scene and owner survive a gateway restart; with the memory store it verifies
 that the old sessions fail closed and skips the durability phase.
+
+`smoke:scale` expects Postgres and Redis on their default ports, a built
+workspace, and the client preview on `:4173`. It starts two gateways itself and
+puts a health-checking TCP proxy in front of each, which is enough to exercise
+the same failover behavior as Nginx. It kills one gateway mid-session, checks
+that the client reconnects to the survivor with the scene intact, then restarts
+both gateways and checks the room again.
+
+### Run two gateways behind Nginx
+
+The `scale` Compose profile builds one gateway image and one web image, starts
+two gateways against the same Postgres and Redis, and puts Nginx on `:8080`:
+
+```bash
+JWT_SECRET=replace-me npm run scale:up
+# then open http://localhost:8080/?room=demo&name=Ada
+```
+
+- Nginx serves the built client and proxies `/api/`, `/healthz` and `/ws` to
+  `gateway-a:8080` / `gateway-b:8080` (least-connections, passive failover).
+- The gateways are also exposed directly on `:8101` and `:8102` for debugging.
+  Their health payloads include the instance name and bus kind:
+
+  ```bash
+  curl http://localhost:8101/healthz
+  # {"status":"ok", ..., "store":"postgres", "bus":"redis", "instance":"gateway-a"}
+  ```
+
+- Stop one gateway while editing to see failover:
+
+  ```bash
+  docker compose --profile scale stop gateway-a
+  ```
+
+  Its browser sockets close, clients reconnect through Nginx to `gateway-b`,
+  and the room state comes from Postgres. Restart it with
+  `docker compose --profile scale start gateway-a`.
+
+- `npm run scale:down` stops the profile services; add `-v` if you also want to
+  delete the Postgres/Redis volumes.
+
+The default `JWT_SECRET` in Compose is development-only. Set a real one before
+exposing the deployment, and terminate TLS in front of Nginx for `wss://`.
 
 The Postgres integration tests are enabled by:
 
@@ -237,21 +330,29 @@ http://localhost:5173/?room=room_…&ws=ws://localhost:8080/ws&name=Ada&invite=�
 unreachable, the editor falls back to a local canvas so the single-user product
 still works; the status bar shows the local/offline state.
 
-## What Stage 4 does not do yet
+## What Stage 5 does not do yet
 
-- **One gateway process.** Redis pub/sub is reserved for cross-instance fan-out
-  in Stage 6; the current gateway holds each room's replica in memory.
 - **Durable offline editing.** A dropped socket keeps the in-memory outbox and
   replays it on reconnect, but a page reload loses unacknowledged edits. An
-  IndexedDB outbox is Stage 5.
+  IndexedDB outbox and local-first optimistic apply remain Stage 6 work.
 - **No optimistic apply.** The author still waits for the echo; local-first
-  apply is Stage 5.
+  apply is Stage 6.
 - **No text RGA.** `editText` is validated and acknowledged, but text is still a
-  whole-string LWW register. Per-character merging is Stage 5.
-- **Snapshots are internal, not named versions.** Restore/history is Stage 5.
+  whole-string LWW register. Per-character merging is Stage 6.
+- **Snapshots are internal, not named versions.** Restore and history browsing
+  are later work.
 - **A joining client receives the projected scene, not full CRDT history.**
   That is sufficient for the operations it receives afterwards; tombstone-aware
   client state transfer is a later refinement.
+- **Redis is transport, not durability.** If Redis is unreachable at startup
+  the gateway logs it and runs standalone; `/healthz` makes that visible instead
+  of pretending it is clustered. Operation data always lives in Postgres.
+- **Failover is reconnect-based.** Existing WebSocket connections do not migrate
+  between gateways; the browser reconnects and resyncs. Nginx routes the new
+  connection to a healthy instance.
+- **Snapshots are not leader-elected.** Any gateway that has the room may write
+  a full snapshot at its watermark and compact covered rows. Duplicate snapshots
+  are harmless but do a little redundant work.
 - **Guest identity is not durable across devices.** There are no passwords,
   email verification or OAuth yet.
 
@@ -267,12 +368,16 @@ still works; the status bar shows the local/offline state.
 | `npm run test`                         | Vitest across workspaces                           |
 | `npm run smoke`                        | Playwright single-user smoke test                  |
 | `npm run smoke:sync`                   | Multi-user auth/presence/role/restart test         |
+| `npm run smoke:scale`                  | Two gateways, failover and full-restart test       |
+| `npm run scale:up`                     | Build/start two gateways + Nginx (Compose profile) |
+| `npm run scale:down`                   | Stop the scaled Compose services                   |
 | `npm run check`                        | Everything CI runs                                 |
 | `npm run migrate -w @syncanvas/server` | Apply the Postgres schema explicitly               |
 | `docker compose up -d`                 | Local Postgres + Redis                             |
 
-CI runs the Postgres integration suite and the multi-user smoke against a
-Postgres service, so the durable path is exercised on every push.
+CI runs the Postgres integration suite, the multi-user smoke and the two-gateway
+scale/failover smoke against Postgres and Redis services, so both the durable
+and clustered paths are exercised on every push.
 
 ## Keyboard shortcuts
 
@@ -294,7 +399,8 @@ Postgres service, so the durable path is exercised on every push.
 shared/   object model, geometry, ops, scene, protocol, HLC, CRDT, HTTP types
 server/   HTTP API, auth, gateway, presence, room registry, store, persistence
 client/   React + Vite editor: canvas, store, sync client, room/access UI
-scripts/  single-user and multi-user browser smoke tests
+scripts/  single-user, multi-user and scale/failover browser smoke tests
+deploy/   Nginx config for two gateways behind one origin
 docs/     DESIGN.md — architecture, CRDT, schema, presence, tradeoffs
 ```
 
@@ -302,7 +408,8 @@ docs/     DESIGN.md — architecture, CRDT, schema, presence, tradeoffs
 
 - **Stage 4 (done):** guest JWT auth, rooms and share links, server-enforced
   roles, live cursors/selection, Postgres operation log and snapshots.
-- **Stage 5:** durable IndexedDB outbox, optimistic local apply, per-character
+- **Stage 5 (done):** snapshot compaction, Redis room bus, cross-instance
+  presence, two gateways behind Nginx, failover and full-restart smoke.
+- **Stage 6:** durable IndexedDB outbox, optimistic local apply, per-character
   text RGA, named versions and restore.
-- **Stage 6:** Redis pub/sub fan-out across gateways, Dockerfiles, AWS deploy,
-  CD, load tests and a public demo.
+- **Stage 7:** k6 load tests, metrics, AWS deploy, CD and a public demo.
