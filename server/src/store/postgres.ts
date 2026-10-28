@@ -43,6 +43,15 @@ interface EnvelopeRow {
 }
 
 /**
+ * Arbitrary application-wide key used only to serialize schema creation.
+ *
+ * Every gateway boots against the same fresh database. PostgreSQL's
+ * `CREATE TABLE IF NOT EXISTS` is not safe under that race, so the whole
+ * migration runs in a transaction holding this advisory lock.
+ */
+const SCHEMA_LOCK_KEY = 0x53594e43;
+
+/**
  * Resolves the schema whether the process runs from `src` (tsx/vitest) or
  * from `dist` after a build.
  */
@@ -88,7 +97,18 @@ export class PostgresStore implements Store {
   /** Creates the schema if it is missing. Safe to call on every boot. */
   async initialize(): Promise<void> {
     const schema = await readSchema();
-    await this.pool.query(schema);
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('SELECT pg_advisory_xact_lock($1)', [SCHEMA_LOCK_KEY]);
+      await client.query(schema);
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   async close(): Promise<void> {

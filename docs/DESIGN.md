@@ -377,6 +377,9 @@ is different: it stores the full merge state, so restart recovery is exact.)
 
 The implementation lives in `server/src/store/schema.sql` and is applied
 idempotently on startup (or with `npm run migrate -w @syncanvas/server`).
+`PostgresStore.initialize()` runs it in a transaction holding a PostgreSQL
+advisory lock, so two gateways booting against a fresh database cannot race
+`CREATE TABLE IF NOT EXISTS` and crash one of them.
 
 ```sql
 CREATE TABLE users (
